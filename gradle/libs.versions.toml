@@ -1,0 +1,24 @@
+[versions]
+kotlin = "2.4.10"
+agp = "9.3.1"
+# Compose Multiplatform 跟随 androidx compose 的大版本:1.12 这条线对应 androidx 1.12,
+# 与 Bilby 那边 BOM 里 pin 的 ui 1.12.0-rc01 同源,Android 侧不会出现编译期与运行期
+# 两个 compose 大版本的错位。
+composeMultiplatform = "1.12.0-beta03"
+kotlinxCoroutines = "1.11.0"
+
+[libraries]
+# 直接写坐标而不用 CMP 插件的 `compose.runtime` 访问器 —— 那批访问器在 1.12 已标记 deprecated。
+# Android target 上这些坐标由 Gradle module metadata 重定向到对应的 androidx 制品,消费方那边
+# 因此仍然由自己的 compose BOM 统一版本。
+compose-runtime = { module = "org.jetbrains.compose.runtime:runtime", version.ref = "composeMultiplatform" }
+compose-ui = { module = "org.jetbrains.compose.ui:ui", version.ref = "composeMultiplatform" }
+compose-foundation = { module = "org.jetbrains.compose.foundation:foundation", version.ref = "composeMultiplatform" }
+
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+
+[plugins]
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+android-kotlin-multiplatform-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }
+compose-multiplatform = { id = "org.jetbrains.compose", version.ref = "composeMultiplatform" }
