@@ -99,11 +99,13 @@ publishing {
 }
 
 signing {
-    // 密钥只从环境变量来,不进仓库也不进 gradle.properties —— 后者会被顺手 commit。
-    // 本地没有配置时不注册签名任务:那样 `./gradlew build` 在任何机器上都能跑,
-    // 只有真要发布时才需要密钥。
-    val key = providers.environmentVariable("SIGNING_KEY").orNull
-    val password = providers.environmentVariable("SIGNING_PASSWORD").orNull
+    // 密钥从 Gradle 属性来。本地放 `~/.gradle/gradle.properties`(在仓库之外,不会被顺手
+    // commit,也不进 shell history);CI 上同一个属性用 ORG_GRADLE_PROJECT_signingKey
+    // 这个环境变量喂进来,构建脚本这边不用分叉。
+    //
+    // 没配置时不注册签名任务 —— `./gradlew build` 在任何机器上都能跑,只有真要发布才需要密钥。
+    val key = providers.gradleProperty("signingKey").orNull
+    val password = providers.gradleProperty("signingPassword").orNull
     if (!key.isNullOrBlank()) {
         useInMemoryPgpKeys(key, password)
         sign(publishing.publications)

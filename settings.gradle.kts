@@ -35,13 +35,14 @@ rootProject.name = "tdanmaku"
 
 nmcpSettings {
     centralPortal {
-        // 凭据只从环境变量来,不进仓库也不进 gradle.properties —— 后者会被顺手 commit。
+        // 凭据从 Gradle 属性来,和签名密钥同一套:本地放 `~/.gradle/gradle.properties`,
+        // CI 上用 ORG_GRADLE_PROJECT_centralUsername 这类环境变量。
         //
-        // 读成字符串而不是传 `providers.environmentVariable(...)`:nmcp 会把这个块塞进一个
-        // GradleLifecycle 隔离动作,而 provider 那条路在 configuration cache 下序列化不了
-        // (报的是 "cannot serialize object of type ValueSourceProvider")。
-        username = System.getenv("CENTRAL_USERNAME").orEmpty()
-        password = System.getenv("CENTRAL_PASSWORD").orEmpty()
+        // 读成字符串而不是把 provider 传进去:nmcp 会把这个块塞进一个 GradleLifecycle 隔离
+        // 动作,provider 那条路在 configuration cache 下序列化不了(报 "cannot serialize
+        // object of type ValueSourceProvider")。
+        username = providers.gradleProperty("centralUsername").orNull.orEmpty()
+        password = providers.gradleProperty("centralPassword").orNull.orEmpty()
         // 上传之后停在门户里等人点发布,不自动放行 —— 发出去的版本撤不回来。
         publishingType = "USER_MANAGED"
     }
