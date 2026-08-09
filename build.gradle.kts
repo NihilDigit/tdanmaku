@@ -105,9 +105,20 @@ signing {
     //
     // 没配置时不注册签名任务 —— `./gradlew build` 在任何机器上都能跑,只有真要发布才需要密钥。
     val key = providers.gradleProperty("signingKey").orNull
-    val password = providers.gradleProperty("signingPassword").orNull
-    if (!key.isNullOrBlank()) {
-        useInMemoryPgpKeys(key, password)
-        sign(publishing.publications)
-    }
+    // 口令传空串而不是 null:无口令的密钥在 null 下构造不出签名者,报的是
+    // "no configured signatory",看不出跟口令有关。
+    val password = providers.gradleProperty("signingPassword").orNull.orEmpty()
+    if (key.isNullOrBlank()) return@signing
+    useInMemoryPgpKeys(key, password)
+
+    // **要等到 afterEvaluate。** KMP 插件是在那时才为每个 target 建 publication 的,在配置
+    // 阶段直接 sign(publishing.publications) 拿到的是一个空容器 —— 不报错,只是一个签名任务
+    // 都不生成,而这件事要到 Central 拒收才会被发现。
+    afterEvaluate { sign(publishing.publications) }
+}
+
+// 签名任务和发布任务之间没有隐式依赖:Gradle 只知道发布要用到那些 .asc 文件所在的目录,
+// 不知道是谁产出的。缺了这一条,并行构建下会出现"发布跑在签名之前"。
+tasks.withType<AbstractPublishToMaven>().configureEach {
+    dependsOn(tasks.withType<Sign>())
 }
