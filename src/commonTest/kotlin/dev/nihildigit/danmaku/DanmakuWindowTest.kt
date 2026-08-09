@@ -242,6 +242,39 @@ class DanmakuWindowTest {
         }
     }
 
+    /**
+     * **快照必须足以重建。** `DanmakuController` 在画布尺寸变化时丢掉旧编排器、拿
+     * [DanmakuCompiler.danmaku] 建一个新的,所以这份快照要如实反映 [DanmakuCompiler.append] 和
+     * [DanmakuCompiler.trimBefore] 做过的事。
+     *
+     * 它曾经不成立:controller 自己另存了一份池子,而那份只被 setPool 更新。转屏一次,直播追加
+     * 进来的整屏弹幕消失、点播裁掉的旧弹幕复活 —— 两处都不会报错,只是画面不对。
+     */
+    @Test
+    fun `快照反映追加与裁剪 据它重建得到同一个池子`() {
+        val cfg = layout()
+        val origin = newCompiler(cfg, DanmakuDensity.STANDARD)
+        origin.setPool(randomPool(500, spanMillis = 60_000L, seed = 37))
+        origin.compileAll()
+
+        val tail = origin.danmaku.last().playTimeMillis
+        repeat(20) { i ->
+            val appended = Danmaku("live$i", tail + 1_000L + i, DanmakuMode.SCROLL, 0xFFFFFF, "追加$i")
+            assertTrue(origin.append(appended), "有序追加被拒绝")
+        }
+        origin.compileAll()
+        assertTrue(origin.danmaku.any { it.id == "live0" }, "追加的弹幕没有进入快照")
+
+        val beforeTrim = origin.danmaku.size
+        origin.trimBefore(40_000L)
+        assertTrue(origin.danmaku.size < beforeTrim, "一条都没裁掉,这个断言就没在验东西")
+
+        // 拿快照重建一个,池子必须逐条相同 —— 追加的还在,裁掉的没回来。
+        val rebuilt = newCompiler(cfg, DanmakuDensity.STANDARD)
+        rebuilt.setPool(origin.danmaku)
+        assertEquals(origin.danmaku, rebuilt.danmaku)
+    }
+
     /** 时间早于池尾的追加必须被拒绝,而不是插进去把后面的序号整体顶歪。 */
     @Test
     fun `乱序追加被拒绝`() {

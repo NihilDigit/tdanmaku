@@ -171,6 +171,13 @@ class DanmakuCompiler(
     private var pool: MutableList<Danmaku> = mutableListOf()
 
     /**
+     * 当前池子的快照,按排序后的顺序。**这是「现在有哪些弹幕」的唯一真相** —— [setPool]、
+     * [append]、[trimBefore] 改的都是这一份。调用方不要另存一份平行的池子:两份一定会分叉,
+     * 分叉的表现是重建之后追加进来的弹幕消失、裁掉的弹幕复活。
+     */
+    val danmaku: List<Danmaku> get() = pool.toList()
+
+    /**
      * `sequences[i]` 是 `pool[i]` 在同模式条目里的序号,喂给 [DanmakuScheduler.schedule]。
      * 数组可以长于 `pool.size`,多出来的是 [append] 预留的容量。
      */

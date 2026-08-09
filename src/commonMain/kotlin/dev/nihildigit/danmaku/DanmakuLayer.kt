@@ -79,14 +79,32 @@ class DanmakuController internal constructor(
      *
      * 不靠 [TextMeasurer] 自带的 LRU:它默认只有 8 项,大池子命中率约等于零;而把它调大意味着
      * 缓存整份 `TextLayoutResult`,那是渲染路径才需要的东西,排布只要两个 float。
+     *
+     * **有上限。** 无界的话直播会一直涨:那边每条文本基本都是新的,而 `trimBefore` 丢的是
+     * 弹幕和排布结果,丢不掉这张表里的字符串。点播的池子本来有界,这个上限碰不到。
      */
-    private val sizeCache = HashMap<String, DanmakuTextSize>()
+    private val sizeCache = LinkedHashMap<String, DanmakuTextSize>()
 
     private val measureStyle = style.baseTextStyle.copy(fontSize = options.fontSizeSp.sp)
 
-    private fun measure(danmaku: Danmaku): DanmakuTextSize = sizeCache.getOrPut(danmaku.text) {
+    private fun measure(danmaku: Danmaku): DanmakuTextSize {
+        // remove + put 把命中的挪到插入顺序的尾部,于是「尾部最新、头部最旧」,淘汰从头取。
+        // Kotlin 的 LinkedHashMap 只承诺插入顺序,对已存在的 key 再 put 一次不改变它的位置。
+        sizeCache.remove(danmaku.text)?.let {
+            sizeCache[danmaku.text] = it
+            return it
+        }
         val size = measurer.measure(text = danmaku.text, style = measureStyle).size
-        DanmakuTextSize(size.width.toFloat(), size.height.toFloat())
+        val measured = DanmakuTextSize(size.width.toFloat(), size.height.toFloat())
+        if (sizeCache.size >= MAX_MEASURED_TEXTS) {
+            val eldest = sizeCache.keys.iterator()
+            if (eldest.hasNext()) {
+                eldest.next()
+                eldest.remove()
+            }
+        }
+        sizeCache[danmaku.text] = measured
+        return measured
     }
 
     // 先按 1×1 建起来,而不是等布局跑完。这样第一帧就有一个真正的 host 挂上去,由它把真实
@@ -97,13 +115,11 @@ class DanmakuController internal constructor(
     internal var canvasHeightPx by mutableFloatStateOf(1f)
         private set
 
-    private var pool: List<Danmaku> = emptyList()
-
     /** 定位/运动弹幕。跟普通弹幕共用同一个时钟,不另起一个 —— 两层各走各的时钟会漂。 */
     internal val specialState = SpecialDanmakuHostState(clock)
 
     // 构造完就存在,不会是 null:上面那个 1×1 的占位尺寸保证了这一点。
-    internal var session by mutableStateOf(buildSession())
+    internal var session by mutableStateOf(buildSession(emptyList()))
         private set
 
     internal fun onCanvasSize(widthPx: Float, heightPx: Float) {
@@ -114,10 +130,17 @@ class DanmakuController internal constructor(
     }
 
     private fun rebuild() {
-        session = buildSession()
+        session = buildSession(session.compiler.danmaku)
     }
 
-    private fun buildSession(): DanmakuSession {
+    /**
+     * 重建时从**上一个编排器**取池子,controller 自己不存一份。
+     *
+     * 存一份的代价是它只会被 [setPool] 更新:[appendNow] 和 [trimBefore] 改的是编排器里那份,
+     * 于是转屏、分屏这类触发重建的事件一发生,新编排器就从一份过期的池子起步 —— 直播追加进来
+     * 的整屏弹幕消失,点播裁掉的旧弹幕复活。
+     */
+    private fun buildSession(pool: List<Danmaku>): DanmakuSession {
         val layout = DanmakuLayoutConfig(
             canvasWidthPx = canvasWidthPx,
             canvasHeightPx = canvasHeightPx,
@@ -135,7 +158,6 @@ class DanmakuController internal constructor(
      * 换一份弹幕池。编排器自己判断新池子是不是旧池子的时间尾部扩展:是就接着排,不是就作废重建。
      */
     fun setPool(danmaku: List<Danmaku>) {
-        pool = danmaku
         session.compiler.setPool(danmaku)
         if (session.compiler.advanceTo(clock.positionMillis)) session.hostState.notifyChanged()
     }
@@ -186,6 +208,9 @@ class DanmakuController internal constructor(
 
     private companion object {
         const val EMIT_LEAD_MILLIS = 100L
+
+        /** 测量缓存的条数上限。同屏加预热窗口远小于这个数,留出的余量是给来回 seek 的。 */
+        const val MAX_MEASURED_TEXTS = 4096
     }
 }
 
