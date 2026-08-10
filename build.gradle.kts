@@ -17,7 +17,7 @@ plugins {
 group = "dev.nihildigit"
 
 val PROJECT_URL = "https://github.com/NihilDigit/tdanmaku"
-version = "0.1.0"
+version = "0.1.1"
 
 kotlin {
     android {
@@ -66,7 +66,20 @@ val javadocJar by tasks.registering(Jar::class) {
     archiveClassifier.set("javadoc")
 }
 
+/**
+ * Central Portal 收的是一个按 Maven 仓库目录结构打好的 zip,不是 `deploy` 到某个 URL。所以这里
+ * 的"仓库"是构建目录下的一个文件夹,[centralBundle] 再把它压起来 —— 上传动作留给人,凭据不进
+ * 构建脚本。
+ */
+val centralBundleDir = layout.buildDirectory.dir("central-bundle")
+
 publishing {
+    repositories {
+        maven {
+            name = "centralBundle"
+            url = uri(centralBundleDir)
+        }
+    }
     publications.withType<MavenPublication>().configureEach {
         artifact(javadocJar)
         pom {
@@ -121,4 +134,30 @@ signing {
 // 不知道是谁产出的。缺了这一条,并行构建下会出现"发布跑在签名之前"。
 tasks.withType<AbstractPublishToMaven>().configureEach {
     dependsOn(tasks.withType<Sign>())
+}
+
+// 上一次发版留下的文件还在这个目录里,不清就会被打进这次的 zip,Portal 那边表现为"这个版本
+// 里混进了别的版本的制品"。
+//
+// 清理挂在每个发布任务上,不挂在聚合任务上:`dependsOn` 只保证跑在聚合任务之前,不保证跑在
+// 它自己那些依赖之前,那样清理会插在两次发布中间,把先产出的制品删掉。
+val cleanCentralBundle by tasks.registering(Delete::class) {
+    delete(centralBundleDir)
+}
+
+tasks.withType<PublishToMavenRepository>().configureEach {
+    if (repository?.name == "centralBundle") dependsOn(cleanCentralBundle)
+}
+
+/**
+ * 待上传的包。`./gradlew centralBundle` 之后把 `build/tdanmaku-<版本>-bundle.zip` 拖进
+ * Central Portal 的 Publish Component。
+ *
+ * maven-metadata.xml 排除掉:那是仓库级的索引,由 Central 自己维护,混在制品里会被判成多余文件。
+ */
+val centralBundle by tasks.registering(Zip::class) {
+    dependsOn("publishAllPublicationsToCentralBundleRepository")
+    from(centralBundleDir) { exclude("**/maven-metadata.xml*") }
+    archiveFileName.set("tdanmaku-$version-bundle.zip")
+    destinationDirectory.set(layout.buildDirectory)
 }
