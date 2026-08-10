@@ -134,6 +134,26 @@ class DanmakuSchedulerTest {
         plan.speedPxPerMillis * cfg.scrollDurationMillis - cfg.viewportPx.width
 
     @Test
+    fun `滚动弹幕自上而下补位 轨道让开后回到最上面`() {
+        val cfg = layout() // 5 条滚动轨道
+        val scheduler = CollisionFreeScheduler(cfg)
+
+        val burst = (0 until 3).map {
+            scheduler.schedule(scroll("b$it", 0L, "一条弹幕"), size("一条弹幕"), it)!!
+        }
+        assertEquals(listOf(0, 1, 2), burst.map { it.track }, "同一时刻的三条没有连续占住最上面三条轨道")
+
+        // 这条才是 first-fit 与 best-fit 的分界:轨道 0 让开之后要回到轨道 0,而不是接着往下
+        // 用还空着的轨道。窗口编排能与整池编排对齐,靠的就是这个回归锚点。
+        val later = scheduler.schedule(
+            scroll("c", cfg.scrollDurationMillis, "一条弹幕"),
+            size("一条弹幕"),
+            3,
+        )!!
+        assertEquals(0, later.track)
+    }
+
+    @Test
     fun `随机弹幕池里同轨任意时刻都不重叠`() {
         val cfg = layout()
         val compiler = DanmakuCompiler(cfg, CollisionFreeScheduler(cfg)) { size(it.text) }

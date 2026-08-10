@@ -147,7 +147,7 @@ private fun fixedPlan(
 )
 
 /**
- * 标准档:无碰撞排布 + 最小空白匹配。
+ * 标准档:无碰撞排布 + 自上而下 first-fit。
  *
  * 设统一穿屏时长为 `D`、视口宽为 `W`、最小间距为 `g`,当前弹幕的发射时间和速度为 `t`、`v`,
  * 第 i 条轨道上尾弹幕的发射时间和速度为 `sᵢ`、`uᵢ`:
@@ -162,10 +162,15 @@ private fun fixedPlan(
  * 退出左边界的那一刻——两者是同一个线性函数在区间两端的取值,取端点较严的那个就够,不需要
  * 逐帧扫描。
  *
- * 在所有 `slack >= 0` 的轨道里选 slack **最小**的一条:以最少的额外空白接续前车,把宽裕的
- * 轨道留给后面更难安置的弹幕。代价相同时优先上方轨道(观感稳定,也让结果与遍历顺序无关)。
- * 从未用过的轨道 remaining 为 0、slack = `W - g`,自然是最大值,于是最后才被选中——空轨道
- * 储备不需要单独的权重参数,它是这条排序规则的推论。
+ * 从轨道 0 往下扫,第一条 `slack >= 0` 的就用,不比较 slack 大小。弹幕总是尽量往上补,低密度
+ * 时下半屏保持干净,画面的纵向重心不随到达节奏漂移。固定弹幕([scheduleFixed])本来就是这个
+ * 规则,两种模式现在同源。
+ *
+ * 上一版在所有安全轨道里取 slack 最小的一条(best-fit),理由是"以最少的额外空白接续前车,把
+ * 宽裕的轨道留给后面更难安置的弹幕"。这个理由没有兑现:13 轨的合成池上两种规则的丢弃率逐条
+ * 可比(3000 条 28/28,9457 条 2680/2682,30000 条 19490/19482),装填率上的差别在噪声里。
+ * 换来的代价却是实的——选轨是一次跨全部轨道的 argmin,任何一条轨道的占用变化都会重排结果,
+ * 于是弹幕散落在整个视口,窗口编排与整池编排也几乎处处分歧(见 [DanmakuCompiler])。
  *
  * 没有安全轨道就丢弃,不延迟:延迟会让弹幕脱离它对应的那句台词,点播场景下不可接受
  * (gap 分析 3.4「不默认延迟」)。
@@ -203,8 +208,6 @@ class CollisionFreeScheduler(private val layout: DanmakuLayoutConfig) : DanmakuS
         val t = danmaku.playTimeMillis
         val limit = layout.viewportPx.width - layout.minGapPx
 
-        var bestTrack = -1
-        var bestSlack = Float.MAX_VALUE
         for (track in 0 until layout.scrollTrackCount) {
             // 这两条分支必须给出相同的 slack:"没用过"和"用过但 remaining 已归零"在判据上
             // 不可区分,窗口化编排(见 [DanmakuCompiler])正是靠这一点才能丢掉 D 毫秒之前的
@@ -215,18 +218,14 @@ class CollisionFreeScheduler(private val layout: DanmakuLayoutConfig) : DanmakuS
                 0L
             }
             val slack = limit - max(scrollLastSpeed[track], motion.speed) * remaining
-            // 严格小于:代价相同时保留先遇到的(编号更小的)轨道。
-            if (slack >= 0f && slack < bestSlack) {
-                bestSlack = slack
-                bestTrack = track
-            }
-        }
-        if (bestTrack < 0) return null
+            if (slack < 0f) continue
 
-        scrollLastEmitMillis[bestTrack] = t
-        scrollLastSpeed[bestTrack] = motion.speed
-        scrollUsed[bestTrack] = true
-        return scrollPlan(danmaku, size, layout, bestTrack, motion)
+            scrollLastEmitMillis[track] = t
+            scrollLastSpeed[track] = motion.speed
+            scrollUsed[track] = true
+            return scrollPlan(danmaku, size, layout, track, motion)
+        }
+        return null
     }
 
     /** 固定弹幕是区间调度、first-fit:常规观感就是从最靠边那条开始往里填。 */
