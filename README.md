@@ -1,5 +1,7 @@
 # tdanmaku
 
+[![Maven Central](https://img.shields.io/maven-central/v/dev.nihildigit/tdanmaku)](https://central.sonatype.com/artifact/dev.nihildigit/tdanmaku)
+
 A danmaku engine for Compose Multiplatform.
 
 - **Every comment type.** Scrolling, top-pinned and bottom-pinned, plus author-positioned comments
