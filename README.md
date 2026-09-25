@@ -26,6 +26,14 @@ class PlayerClock(private val player: Player) : DanmakuClock {
 }
 ```
 
+ExoPlayer advances `currentPosition` in 10 ms steps, and sampling a step function at 120 Hz leaves
+some frames where nothing moves. Wrap such a clock in `SmoothedDanmakuClock`, which tracks the
+reported position per frame and follows speed changes without jumping:
+
+```kotlin
+val clock = remember(player) { SmoothedDanmakuClock(PlayerClock(player)) }
+```
+
 ```kotlin
 val controller = rememberDanmakuController(
     clock = clock,

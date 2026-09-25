@@ -49,6 +49,16 @@ interface DanmakuClock {
     val positionMillis: Long
     val isPlaying: Boolean
     val playbackSpeed: Float
+
+    /**
+     * 这一帧该画的播放位置。[frameTimeNanos] 是帧时钟给的 vsync 时刻,与 `System.nanoTime()`
+     * 同一基准(Android 上就是 Choreographer 的帧时间)。
+     *
+     * 默认退回 [positionMillis]。播放器的位置若是按固定步长更新的(ExoPlayer 播放中每 10ms
+     * 写一次),以 8.3ms 的帧间隔去采样,每隔几帧就有一帧位置不动,满帧率也看得出顿挫。这种
+     * 读数用 [SmoothedDanmakuClock] 包一层。外推只在时钟这一层做,host 不做。
+     */
+    fun positionAtFrame(frameTimeNanos: Long): Long = positionMillis
 }
 
 /**
@@ -190,7 +200,7 @@ class DanmakuHostState(
                 // 跳帧判断整个都在回调内部:不出帧就只更新 deadline,不重新采样、不回调。
                 if (!frameScheduler.shouldDraw(frameNanos)) return@withFrameNanos
 
-                coarsePosition = clock.positionMillis
+                coarsePosition = clock.positionAtFrame(frameNanos)
                 buffer.clear()
                 timeline.visibleAt(coarsePosition) { buffer.add(it) }
                 onFrame(buffer, coarsePosition)

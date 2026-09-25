@@ -11,7 +11,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.Stable
-import androidx.compose.runtime.withFrameMillis
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -304,7 +304,7 @@ fun SpecialDanmakuHost(
         if (!hasContent) return@LaunchedEffect
         var lastPosition = Long.MIN_VALUE
         while (true) {
-            val now = withFrameMillis { state.clock.positionMillis }
+            val now = withFrameNanos { state.clock.positionAtFrame(it) }
             if (now == lastPosition && !state.clock.isPlaying) {
                 // 暂停时画面不变,不必每个 vsync 都要一帧;恢复播放最多迟到这一个间隔。
                 delay(PAUSED_POLL_MILLIS)
