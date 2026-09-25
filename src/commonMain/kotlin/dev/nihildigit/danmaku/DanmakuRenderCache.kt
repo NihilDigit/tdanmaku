@@ -7,18 +7,25 @@ import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.GraphicsContext
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.Placeholder
+import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.em
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.sp
 import kotlin.math.ceil
+import kotlin.math.roundToInt
 
 /**
  * 渲染层的可调外观参数。库不带主题(不引 material3),字体、颜色兜底、描边、透明度全部由
@@ -137,7 +144,7 @@ class DanmakuRenderStats {
  * [TextStyle] 当 key,而不是手抄一份"我认为重要的属性"清单。抄清单这条路走不通:漏一个属性
  * 表现为"换了字体但排版没变",而且以后每加一个可配样式都要记得回来补,没人会记得。
  */
-internal data class DanmakuLayoutKey(val text: String, val style: TextStyle)
+internal data class DanmakuLayoutKey(val text: String, val style: TextStyle, val images: List<DanmakuImage>)
 
 /**
  * display list 的 key。比 [DanmakuLayoutKey] 多一个颜色(录制时颜色被烤进 display list),
@@ -146,7 +153,44 @@ internal data class DanmakuLayoutKey(val text: String, val style: TextStyle)
  * 白算一次 [TextStyle.hashCode]。这个哈希不便宜(要走遍 SpanStyle + ParagraphStyle 的几十个
  * 字段),而这个 key 是每帧每条弹幕都要算一次的东西,320 条同屏时那点开销正是我们要省的。
  */
-internal data class DanmakuLayerKey(val text: String, val fontSizeSp: Float?, val colorRgb: Int)
+internal data class DanmakuLayerKey(
+    val text: String,
+    val fontSizeSp: Float?,
+    val colorRgb: Int,
+    val images: List<DanmakuImage>,
+)
+
+/**
+ * 按键取图。库不加载图片,只在录制一条弹幕时问一次;返回 null 表示还没到,那条先留空位,之后
+ * 每帧再问,到了就重录。
+ */
+fun interface DanmakuImageSource {
+    fun imageOrNull(key: String): ImageBitmap?
+
+    companion object {
+        val None: DanmakuImageSource = DanmakuImageSource { null }
+    }
+}
+
+/**
+ * 排版一条弹幕。**编排测宽与渲染录制都走这里**,两边的宽度因此必然一致:图的占位、字号解析
+ * 任何一处只在一边做,排布就按一套宽度算、画面按另一套画。
+ */
+internal fun TextMeasurer.layoutDanmaku(danmaku: Danmaku, style: TextStyle): TextLayoutResult {
+    val images = danmaku.validImages()
+    if (images.isEmpty()) return measure(text = danmaku.text, style = style)
+    return measure(
+        text = AnnotatedString(danmaku.text),
+        style = style,
+        placeholders = images.map {
+            AnnotatedString.Range(
+                Placeholder(it.widthEm.em, it.heightEm.em, PlaceholderVerticalAlign.Center),
+                it.start,
+                it.end,
+            )
+        },
+    )
+}
 
 /**
  * 分级绘制后端的第一、二级(gap 分析 3.4「文字准备与绘制后端」):
@@ -185,6 +229,7 @@ internal class DanmakuRenderCache(
     private val layoutDirection: LayoutDirection,
     private val style: DanmakuRenderStyle,
     val stats: DanmakuRenderStats,
+    private val imageSource: DanmakuImageSource = DanmakuImageSource.None,
     private val maxLayers: Int = MAX_LAYERS,
     private val maxLayouts: Int = MAX_LAYOUTS,
 ) {
@@ -212,7 +257,13 @@ internal class DanmakuRenderCache(
     private var frameId = 0L
     private var released = false
 
-    private class LayerEntry(val layer: GraphicsLayer, var lastUsedFrame: Long)
+    /** [imagesPending] 为真时,录制那一刻有图还没到,[draw] 每帧检查一次,到齐就重录。 */
+    private class LayerEntry(
+        val layer: GraphicsLayer,
+        var lastUsedFrame: Long,
+        val danmaku: Danmaku,
+        var imagesPending: Boolean,
+    )
 
     /** 绘制一帧的开始。帧号是[endFrame] 判断"这条本帧还在用、不能回收"的依据。 */
     fun beginFrame() {
@@ -247,6 +298,9 @@ internal class DanmakuRenderCache(
             create(key, danmaku)
         }
         entry.lastUsedFrame = frameId
+        if (entry.imagesPending && entry.danmaku.validImages().all { imageSource.imageOrNull(it.key) != null }) {
+            entry.imagesPending = record(entry.layer, layoutOf(entry.danmaku), entry.danmaku)
+        }
         stats.onLayerReused()
         val pad = padPx.toFloat()
         scope.translate(x - pad, y - pad) {
@@ -276,10 +330,8 @@ internal class DanmakuRenderCache(
     private fun create(key: DanmakuLayerKey, danmaku: Danmaku): LayerEntry {
         val layout = layoutOf(danmaku)
         val layer = graphicsContext.createGraphicsLayer()
-        // danmaku.color 是不带 alpha 的 24 位 RGB,直接塞进 Color(Int) 会被当成 0x00RRGGBB
-        // (alpha=0,全透明),必须先把 alpha 字节填满。
-        record(layer, layout, Color(danmaku.color or ALPHA_OPAQUE_MASK))
-        val entry = LayerEntry(layer, frameId)
+        val pending = record(layer, layout, danmaku)
+        val entry = LayerEntry(layer, frameId, danmaku, pending)
         layers[key] = entry
         stats.onLayerCreated(layers.size)
         return entry
@@ -293,10 +345,14 @@ internal class DanmakuRenderCache(
      * [TextLayoutResult],第一遍把 `Stroke` 设进了底层 paragraph,第二遍不传就会继续描边,
      * 肉眼看是空心字。凡是共享 [TextLayoutResult] 做多遍绘制的地方都有这个坑。
      */
-    private fun record(layer: GraphicsLayer, layout: TextLayoutResult, color: Color) {
+    private fun record(layer: GraphicsLayer, layout: TextLayoutResult, danmaku: Danmaku): Boolean {
         val size = IntSize(layout.size.width + padPx * 2, layout.size.height + padPx * 2)
         val topLeft = Offset(padPx.toFloat(), padPx.toFloat())
         val stroke = strokeStyle
+        // danmaku.color 是不带 alpha 的 24 位 RGB,直接塞进 Color(Int) 会被当成 0x00RRGGBB
+        // (alpha=0,全透明),必须先把 alpha 字节填满。
+        val color = Color(danmaku.color or ALPHA_OPAQUE_MASK)
+        var imagesPending = false
         layer.record(density, layoutDirection, size) {
             if (stroke != null) {
                 drawText(
@@ -314,7 +370,23 @@ internal class DanmakuRenderCache(
                 alpha = style.opacity,
                 drawStyle = Fill,
             )
+            // 图画在占位上,不描边:描边是给文字在任意底色上保持可读的,图自带轮廓。
+            danmaku.validImages().forEachIndexed { index, image ->
+                val rect = layout.placeholderRects.getOrNull(index) ?: return@forEachIndexed
+                val bitmap = imageSource.imageOrNull(image.key)
+                if (bitmap == null) {
+                    imagesPending = true
+                    return@forEachIndexed
+                }
+                drawImage(
+                    image = bitmap,
+                    dstOffset = IntOffset((rect.left + topLeft.x).roundToInt(), (rect.top + topLeft.y).roundToInt()),
+                    dstSize = IntSize(rect.width.roundToInt(), rect.height.roundToInt()),
+                    alpha = style.opacity,
+                )
+            }
         }
+        return imagesPending
     }
 
     private fun layoutOf(danmaku: Danmaku): TextLayoutResult {
@@ -324,7 +396,7 @@ internal class DanmakuRenderCache(
             return it
         }
         stats.onLayoutMiss()
-        val layout = measurer.measure(text = danmaku.text, style = key.style)
+        val layout = measurer.layoutDanmaku(danmaku, key.style)
         layouts[key] = layout
         return layout
     }
@@ -410,7 +482,8 @@ internal fun layoutKeyOf(
     danmaku: Danmaku,
     style: DanmakuRenderStyle,
     styleByFontSize: MutableMap<Float, TextStyle>? = null,
-): DanmakuLayoutKey = DanmakuLayoutKey(danmaku.text, resolvedTextStyleOf(danmaku, style, styleByFontSize))
+): DanmakuLayoutKey =
+    DanmakuLayoutKey(danmaku.text, resolvedTextStyleOf(danmaku, style, styleByFontSize), danmaku.validImages())
 
 internal fun layerKeyOf(danmaku: Danmaku, style: DanmakuRenderStyle): DanmakuLayerKey =
-    DanmakuLayerKey(danmaku.text, fontSizeSpOf(danmaku, style), danmaku.color)
+    DanmakuLayerKey(danmaku.text, fontSizeSpOf(danmaku, style), danmaku.color, danmaku.validImages())

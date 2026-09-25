@@ -259,6 +259,7 @@ class DanmakuHostState(
  *
  * @param renderStats 传进来就能观测缓存行为(命中/未命中、layer 创建/复用/回收);不传就内部
  *   自己建一份,统计照常发生,只是没人读。
+ * @param imageSource [Danmaku.images] 的图从这里取。
  */
 @Composable
 fun DanmakuHost(
@@ -266,6 +267,7 @@ fun DanmakuHost(
     style: DanmakuRenderStyle = DanmakuRenderStyle(),
     modifier: Modifier = Modifier,
     renderStats: DanmakuRenderStats? = null,
+    imageSource: DanmakuImageSource = DanmakuImageSource.None,
     onCanvasSizeMismatch: (actualWidthPx: Float, actualHeightPx: Float) -> Unit = { _, _ -> },
 ) {
     // 这个 measurer 只在准备阶段用,每条文本最多进来一次,自带的 LRU 已经不是热路径 ——
@@ -281,8 +283,8 @@ fun DanmakuHost(
 
     // 缓存挂在样式和 density 上:字号、字体、颜色兜底、描边、不透明度任一变化,已录的
     // display list 全部作废(alpha 是烤进去的,见 DanmakuRenderCache 的类注释)。
-    val cache = remember(measurer, graphicsContext, density, layoutDirection, style, stats) {
-        DanmakuRenderCache(measurer, graphicsContext, density, layoutDirection, style, stats)
+    val cache = remember(measurer, graphicsContext, density, layoutDirection, style, stats, imageSource) {
+        DanmakuRenderCache(measurer, graphicsContext, density, layoutDirection, style, stats, imageSource)
     }
     // GraphicsLayer 不还回去就是显存泄漏。remember 换实例和离开组合两条路都要走到 release,
     // DisposableEffect(cache) 两者都覆盖:key 变化时先 onDispose 旧的。

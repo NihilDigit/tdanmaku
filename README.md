@@ -104,6 +104,25 @@ comment and its flight plan.
 A live source needs a monotonic clock of its own. A live HLS position is measured inside a sliding
 window and moves backwards when old segments are dropped, which the compiler reads as a seek.
 
+## Images in comments
+
+A range of the text can be drawn as an image, such as a sticker that replaces `[dog]`. Sizes are in
+ems, so images scale with the font.
+
+```kotlin
+Danmaku(
+    id = id, playTimeMillis = t, mode = DanmakuMode.SCROLL, color = 0xFFFFFF,
+    text = "hello [dog]",
+    images = listOf(DanmakuImage(start = 6, end = 11, key = url, widthEm = 1.2f, heightEm = 1.2f)),
+)
+
+val controller = rememberDanmakuController(clock, options, imageSource = { key -> cache[key] })
+```
+
+The library loads nothing itself. It asks the `DanmakuImageSource` when a comment is first drawn;
+a `null` leaves blank space of the declared size, and the comment is redrawn once the image is
+available. Width is fixed at layout time, so a late image never moves a comment.
+
 ## Status
 
 Early, and the API will change. Targets are `android`, `jvm`, `iosArm64` and `iosSimulatorArm64`;

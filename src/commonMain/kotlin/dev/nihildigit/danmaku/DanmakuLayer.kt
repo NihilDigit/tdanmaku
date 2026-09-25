@@ -15,7 +15,6 @@ import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.Density
-import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 
 /**
@@ -61,6 +60,7 @@ class DanmakuController internal constructor(
     private val measurer: TextMeasurer,
     private val displayDensity: Density,
     baseTextStyle: TextStyle,
+    internal val imageSource: DanmakuImageSource,
 ) {
 
     private val fontSizePx = options.fontSizeSp * displayDensity.density * displayDensity.fontScale
@@ -83,18 +83,20 @@ class DanmakuController internal constructor(
      * **有上限。** 无界的话直播会一直涨:那边每条文本基本都是新的,而 `trimBefore` 丢的是
      * 弹幕和排布结果,丢不掉这张表里的字符串。点播的池子本来有界,这个上限碰不到。
      */
-    private val sizeCache = LinkedHashMap<String, DanmakuTextSize>()
+    private val sizeCache = LinkedHashMap<DanmakuLayoutKey, DanmakuTextSize>()
 
-    private val measureStyle = style.baseTextStyle.copy(fontSize = options.fontSizeSp.sp)
+    private val styleByFontSize = HashMap<Float, TextStyle>()
 
     private fun measure(danmaku: Danmaku): DanmakuTextSize {
+        // 键与渲染侧的排版缓存同一种:文本、解析后的样式、图的占位,任何一样不同宽度都不同。
+        val key = layoutKeyOf(danmaku, style, styleByFontSize)
         // remove + put 把命中的挪到插入顺序的尾部,于是「尾部最新、头部最旧」,淘汰从头取。
         // Kotlin 的 LinkedHashMap 只承诺插入顺序,对已存在的 key 再 put 一次不改变它的位置。
-        sizeCache.remove(danmaku.text)?.let {
-            sizeCache[danmaku.text] = it
+        sizeCache.remove(key)?.let {
+            sizeCache[key] = it
             return it
         }
-        val size = measurer.measure(text = danmaku.text, style = measureStyle).size
+        val size = measurer.layoutDanmaku(danmaku, key.style).size
         val measured = DanmakuTextSize(size.width.toFloat(), size.height.toFloat())
         if (sizeCache.size >= MAX_MEASURED_TEXTS) {
             val eldest = sizeCache.keys.iterator()
@@ -103,7 +105,7 @@ class DanmakuController internal constructor(
                 eldest.remove()
             }
         }
-        sizeCache[danmaku.text] = measured
+        sizeCache[key] = measured
         return measured
     }
 
@@ -224,6 +226,9 @@ internal class DanmakuSession(
  * 建一个 [DanmakuController]。
  *
  * [contentKey] 变化时整池重编:换一集、换一个直播间,旧时间轴里的一切都作废。为空表示内容不换。
+ *
+ * [imageSource] 给 [Danmaku.images] 取图。换一个实例会让已录好的弹幕全部重录,调用方要
+ * remember 住它。
  */
 @Composable
 fun rememberDanmakuController(
@@ -231,11 +236,12 @@ fun rememberDanmakuController(
     options: DanmakuOptions = DanmakuOptions(),
     baseTextStyle: TextStyle = TextStyle.Default,
     contentKey: Any? = null,
+    imageSource: DanmakuImageSource = DanmakuImageSource.None,
 ): DanmakuController {
     val measurer = rememberTextMeasurer()
     val density = LocalDensity.current
-    return remember(clock, options, baseTextStyle, contentKey, measurer, density) {
-        DanmakuController(clock, options, measurer, density, baseTextStyle)
+    return remember(clock, options, baseTextStyle, contentKey, measurer, density, imageSource) {
+        DanmakuController(clock, options, measurer, density, baseTextStyle, imageSource)
     }
 }
 
@@ -262,6 +268,7 @@ fun DanmakuLayer(controller: DanmakuController, modifier: Modifier = Modifier) {
     DanmakuHost(
         state = controller.session.hostState,
         style = controller.style,
+        imageSource = controller.imageSource,
         onCanvasSizeMismatch = controller::onCanvasSize,
         modifier = modifier.fillMaxSize(),
     )

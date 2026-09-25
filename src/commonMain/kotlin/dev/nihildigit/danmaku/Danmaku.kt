@@ -26,6 +26,7 @@ enum class DanmakuMode {
  *   逐条弹幕可变的量,不保留就再也拿不回来了。
  * @param isSelf 是否为本端发出的弹幕,渲染层用于高亮与兜底放置。当前没有任何数据源会产出
  *   `true`(发弹幕功能未实现),但字段本身要留着,不能等到发弹幕功能落地才补。
+ * @param images 正文里画成图的那几段,见 [DanmakuImage]。
  */
 data class Danmaku(
     val id: String,
@@ -35,4 +36,35 @@ data class Danmaku(
     val text: String,
     val fontSize: Int? = null,
     val isSelf: Boolean = false,
+    val images: List<DanmakuImage> = emptyList(),
 )
+
+/**
+ * 正文 `[start, end)` 这一段画成一张图,文字本身不画。整条弹幕就是一张图时,范围盖住全文。
+ *
+ * 图从哪来由调用方决定,这里只有一个 [key],渲染时交给 `DanmakuImageSource` 去取。图还没到时
+ * 按尺寸留出空位:宽度在编排时就定下来了,不能因为图晚到而变。
+ *
+ * 尺寸以字号为单位,不用像素:图要跟着文字一起缩放。高度超过行高比例
+ * ([DanmakuOptions.lineHeightRatio])会压到相邻轨道上。
+ *
+ * 一条弹幕里的图要按起点排好、互不重叠、不越界,否则整条只画文字。
+ */
+data class DanmakuImage(
+    val start: Int,
+    val end: Int,
+    val key: String,
+    val widthEm: Float,
+    val heightEm: Float,
+)
+
+/** [Danmaku.images] 能不能原样当排版占位用。不能就整条退回纯文字,不去猜调用方的意图。 */
+internal fun Danmaku.validImages(): List<DanmakuImage> {
+    var previousEnd = 0
+    for (image in images) {
+        if (image.start < previousEnd || image.end <= image.start || image.end > text.length) return emptyList()
+        if (image.widthEm <= 0f || image.heightEm <= 0f) return emptyList()
+        previousEnd = image.end
+    }
+    return images
+}
