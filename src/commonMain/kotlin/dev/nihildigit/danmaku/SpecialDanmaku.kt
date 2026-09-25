@@ -1,12 +1,11 @@
 package dev.nihildigit.danmaku
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -16,19 +15,30 @@ import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.GraphicsContext
+import androidx.compose.ui.graphics.layer.CompositingStrategy
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.StrokeJoin
-import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalGraphicsContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.TextMeasurer
-import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
+import kotlin.math.ceil
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.TimeSource
+import kotlinx.coroutines.delay
 
 /**
  * 位移插值方式。只有这两种是因为数据源(B 站 mode 7)只表达得出这两种,不是这一层的能力上限。
@@ -118,9 +128,8 @@ data class SpecialDanmakuMotion(
 /**
  * 给定播放进度求这条弹幕的即时状态;不在寿命区间内返回 null。
  *
- * **没有逐条动画状态,也没有预计算缓存。** 整条弹幕是时间的纯函数,求一次就出结果,seek、变速、
- * 暂停因此不需要任何同步逻辑。一个视频里这类弹幕通常是个位数到几十条,跟滚动弹幕的几千条差两三
- * 个数量级——给它加缓存的成本会超过它省下的乘法。
+ * **没有逐条动画状态。** 整条弹幕是时间的纯函数,求一次就出结果,seek、变速、暂停因此不需要
+ * 任何同步逻辑。
  */
 fun SpecialDanmaku.motionAt(playTimeMillis: Long): SpecialDanmakuMotion? {
     if (durationMillis <= 0L) return null
@@ -182,24 +191,12 @@ class SpecialDanmakuHostState(internal val clock: DanmakuClock) {
         }
 
     /**
-     * 帧循环写入的当前播放进度。渲染层在 `graphicsLayer` 的 lambda 里读它,那里的 state 读取
-     * 只会让图层失效,不触发重组——所以每帧更新它的代价是"图层重新算一次变换矩阵",而不是
-     * "整棵子树重组一遍"。
-     */
-    internal var positionMillis by mutableLongStateOf(0L)
-
-    /**
-     * 当前该进组合的那些。**不是整池。**
+     * 当前时间附近可能在屏的那些,**不是整池**。绘制和预热都只扫这一段。
      *
-     * 这一层每条弹幕都是一个已组合节点、各带一个 [androidx.compose.ui.graphics.GraphicsLayer],
-     * 而上面那个 `positionMillis` 每帧变一次会让**所有**图层重算变换矩阵——不在寿命内的也一样,
-     * 它们只是 alpha=0。几十条时无所谓,真机上撞到了几百条 mode 7 的视频:帧耗时 50th 从 14ms
-     * 涨到 21ms、jank 从 10% 涨到 44%,而 GPU 一直是 4ms,全压在主线程算矩阵上。
-     *
-     * 所以按时间切一刀。**不能每帧切**——那样每帧都要重组一遍子树,比省下来的更贵;按
-     * [ACTIVE_BUCKET_MILLIS] 分桶,进度跨桶才重算,重组降到每秒一次量级。
+     * 按 [ACTIVE_BUCKET_MILLIS] 分桶、跨桶才重算,是为了不在每帧上做一次过滤和分配。它不是
+     * Compose state:绘制块每帧都因为帧版本号重画,读到的总是最新值,不需要再订阅一次。
      */
-    internal var activeDanmaku: List<SpecialDanmaku> by mutableStateOf(emptyList())
+    internal var activeDanmaku: List<SpecialDanmaku> = emptyList()
         private set
 
     private var activeBucket = Long.MIN_VALUE
@@ -247,8 +244,8 @@ private fun List<SpecialDanmaku>.isSortedByStart(): Boolean {
 }
 
 /**
- * 活跃区间的分桶粒度。取 2 秒:mode 7 的 `duration` 常见几秒量级,桶太小会让重组频繁,
- * 太大又会让组合里堆着一批还没进场的。
+ * 活跃区间的分桶粒度。取 2 秒:mode 7 的 `duration` 常见几秒量级,桶太小会频繁重新过滤、
+ * 释放图层,太大又会让每帧扫一批还没进场的。
  */
 private const val ACTIVE_BUCKET_MILLIS = 2_000L
 
@@ -259,11 +256,19 @@ private const val ACTIVE_BUCKET_MILLIS = 2_000L
  * 见 [SpecialDanmaku] 的文档:位置是作者指定的,不是引擎排的,收进显示区域等于揉烂作者的编排。
  * 调用方应当把它叠在 [DanmakuHost] 之上、铺满整个画面。
  *
- * 每条弹幕是一个自带 `graphicsLayer` 的独立节点,不是画在同一张 Canvas 上:`rotationY` 要的是
- * **带透视的 3D 旋转**,`DrawScope` 的仿射变换给不出来,只有图层能给。代价是一条弹幕一个图层,
- * 这在 mode 7 上是划算的——一个视频里通常个位数到几十条,跟滚动弹幕差两三个数量级。
+ * **整层只有一张 Canvas,每条弹幕是一份录好的 [GraphicsLayer],不是一个组合节点。** 上一版
+ * 一条弹幕一个带 `graphicsLayer` 的节点,字符画类视频(同屏上千条 mode 7)在真机上主线程
+ * 35% 耗在每帧逐个重算图层参数,RenderThread 43% 耗在逐条重画文字。后者是因为透明度设在了
+ * 节点图层的 alpha 上:用户的弹幕不透明度默认小于 1,每条都因此走离屏合成。
  *
- * 文字排版走 [TextMeasurer] 自带的 LRU,这里不另建缓存(理由同 [DanmakuHost])。
+ * 现在的分工:
+ * - 旋转与透视是弹幕的静态属性,录制时写进它自己那份图层的 `rotationY`/`rotationZ`/
+ *   `cameraDistance`,之后不再改。`rotationY` 带透视,`DrawScope` 的变换表达不出来,这是
+ *   每条仍要一份图层的原因。
+ * - 位置每帧变,用画布平移表达,不碰图层属性。
+ * - 透明度用 [CompositingStrategy.ModulateAlpha] 逐个绘制命令地乘,不开离屏,值没变就不写。
+ *   它跟 [DanmakuRenderCache] 把 alpha 烤进绘制命令的结果逐像素相同,描边会从半透明的填充
+ *   下透出来,两层弹幕的观感由此一致。
  *
  * @param style 复用普通弹幕的外观参数,但**只取 `baseTextStyle` 的字体族/字重、描边和
  *   `opacity`**:字号由 [SpecialDanmaku.fontSizeFraction] 决定,不跟随用户的全局字号设置;
@@ -275,110 +280,189 @@ fun SpecialDanmakuHost(
     style: DanmakuRenderStyle = DanmakuRenderStyle(),
     modifier: Modifier = Modifier,
 ) {
-    val measurer = rememberTextMeasurer(cacheSize = 64)
+    val measurer = rememberTextMeasurer()
+    val graphicsContext = LocalGraphicsContext.current
+    val density = LocalDensity.current
+    val layoutDirection = LocalLayoutDirection.current
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     val hasContent = state.danmaku.isNotEmpty()
 
+    // 字号按画布高度换算,画布一变全部重录。
+    val cache = remember(measurer, graphicsContext, density, layoutDirection, style, canvasSize) {
+        SpecialDanmakuRenderCache(measurer, graphicsContext, density, layoutDirection, style, canvasSize)
+    }
+    DisposableEffect(cache) {
+        onDispose { cache.release() }
+    }
+
+    var framePositionMillis by remember { mutableLongStateOf(0L) }
+    var frameVersion by remember { mutableIntStateOf(0) }
+
     // 列表为空时不跑帧循环。绝大多数视频一条 mode 7 都没有,那种情况下这一层应该完全不产生
-    // 每帧工作量;这里不像 DanmakuHost 那样在"无可见弹幕"时挂起,是因为判定可见需要先遍历
-    // 一遍列表,而列表本身就只有几十条——省下的还不如判定花的多。
-    LaunchedEffect(state, hasContent) {
+    // 每帧工作量。
+    LaunchedEffect(state, hasContent, cache) {
         if (!hasContent) return@LaunchedEffect
+        var lastPosition = Long.MIN_VALUE
         while (true) {
-            withFrameMillis { }
-            val now = state.clock.positionMillis
-            state.positionMillis = now
+            val now = withFrameMillis { state.clock.positionMillis }
+            if (now == lastPosition && !state.clock.isPlaying) {
+                // 暂停时画面不变,不必每个 vsync 都要一帧;恢复播放最多迟到这一个间隔。
+                delay(PAUSED_POLL_MILLIS)
+                continue
+            }
+            lastPosition = now
             // 跨桶才重算活跃区间,见 SpecialDanmakuHostState.activeDanmaku。
             state.onPositionChanged(now)
+            cache.prewarm(state.activeDanmaku, now)
+            framePositionMillis = now
+            frameVersion++
         }
     }
 
-    // **必须裁到自己的边界。** 下面每条弹幕在这个 Box 里都占 0×0(见 SpecialDanmakuItem 里
-    // 那个 layout 块),位置纯靠 graphicsLayer 的 translation 平移出去,而 Compose 默认不裁剪
-    // ——节点平移到哪就画到哪。作者又常把坐标写在画外让弹幕飞进来,所以溢出是常态不是异常。
-    // 全屏时这个 Box 铺满屏幕,溢出看不出来;退出全屏后它只有视频那一块,不裁的话弹幕会画到
-    // 视频外面、盖在页面其它内容上。DanmakuHost 那边是靠自己 clipRect 到视口达到同一效果。
-    Box(modifier = modifier.clipToBounds().onSizeChanged { canvasSize = it }) {
-        if (canvasSize.width == 0 || canvasSize.height == 0) return@Box
+    // **必须裁到自己的边界。** 作者常把坐标写在画外让弹幕飞进来,溢出是常态不是异常。全屏时
+    // 画布铺满屏幕,溢出看不出来;退出全屏后它只有视频那一块,不裁的话弹幕会画到视频外面、
+    // 盖在页面其它内容上。
+    Canvas(modifier = modifier.clipToBounds().onSizeChanged { canvasSize = it }) {
+        // 读一次 frameVersion,让绘制块订阅帧循环的写入。
+        @Suppress("UNUSED_EXPRESSION")
+        frameVersion
+
+        if (canvasSize.width == 0 || canvasSize.height == 0) return@Canvas
+        cache.beginFrame()
         for (item in state.activeDanmaku) {
-            key(item.id) {
-                SpecialDanmakuItem(item, state, canvasSize, style, measurer)
-            }
+            val motion = item.motionAt(framePositionMillis) ?: continue
+            // 归一化坐标指的是文字**左上角**在画布上的落点,不是中心。
+            cache.draw(this, item, motion, motion.x * size.width, motion.y * size.height)
         }
+        cache.endFrame(state.activeDanmaku)
     }
 }
 
-@Composable
-private fun SpecialDanmakuItem(
-    danmaku: SpecialDanmaku,
-    state: SpecialDanmakuHostState,
-    canvasSize: IntSize,
-    style: DanmakuRenderStyle,
-    measurer: TextMeasurer,
+/**
+ * 定位弹幕的图层缓存:每条一份录好描边与填充的 [GraphicsLayer],按 [SpecialDanmaku.id] 索引。
+ *
+ * 生命周期跟着活跃区间走:条目离开 [SpecialDanmakuHostState.activeDanmaku] 就释放。定位弹幕
+ * 不像滚动弹幕那样会大量重复同一句话,按文本共享图层省不下什么,还得处理同文本不同旋转。
+ */
+internal class SpecialDanmakuRenderCache(
+    private val measurer: TextMeasurer,
+    private val graphicsContext: GraphicsContext,
+    private val density: Density,
+    private val layoutDirection: LayoutDirection,
+    private val style: DanmakuRenderStyle,
+    private val canvasSize: IntSize,
 ) {
-    val density = LocalDensity.current
-    val textStyle = remember(style.baseTextStyle, danmaku.fontSizeFraction, canvasSize.height, density) {
-        val fontSizePx = danmaku.fontSizeFraction * canvasSize.height
-        style.baseTextStyle.copy(fontSize = with(density) { fontSizePx.toSp() })
-    }
-    val layoutResult = remember(danmaku.text, textStyle, measurer) {
-        measurer.measure(text = danmaku.text, style = textStyle)
-    }
-    val color = remember(danmaku.color) { Color(danmaku.color or ALPHA_OPAQUE_MASK) }
-    val strokeStyle = remember(style.strokeWidthPx, danmaku.hasStroke) {
-        if (danmaku.hasStroke && style.strokeWidthPx > 0f) {
-            Stroke(width = style.strokeWidthPx, miter = 3f, join = StrokeJoin.Round)
-        } else {
-            null
-        }
-    }
-    val sizeDp = with(density) { layoutResult.size.width.toDp() to layoutResult.size.height.toDp() }
+    private class Entry(val layer: GraphicsLayer, val padPx: Float, var alpha: Float)
 
-    Canvas(
-        modifier = Modifier
-            // 自身在父布局里占 0×0,并以无约束尺寸测量下游。缺了这一步,一条比画面还宽的
-            // 弹幕(作者常这么干,让它从画外飞进来)会被 Box 的约束压回画面宽度,文字被迫折行
-            // ——那是排版被改了,不是位置被改了,画面上看不出是约束干的。
-            .layout { measurable, _ ->
-                val placeable = measurable.measure(Constraints())
-                layout(0, 0) { placeable.place(0, 0) }
-            }
-            .size(sizeDp.first, sizeDp.second)
-            // 位置、透明度、旋转全在图层里算:这个 lambda 读 state.positionMillis,读取只让
-            // 图层失效,不触发重组,所以每帧只重算变换矩阵,文字的 display list 录一次就不动了。
-            .graphicsLayer {
-                val motion = danmaku.motionAt(state.positionMillis)
-                if (motion == null) {
-                    alpha = 0f
-                    return@graphicsLayer
-                }
-                alpha = motion.alpha * style.opacity
-                // 归一化坐标指的是文字**左上角**在画布上的落点,不是中心。
-                translationX = motion.x * canvasSize.width
-                translationY = motion.y * canvasSize.height
-                rotationZ = danmaku.rotateZDegrees
-                rotationY = danmaku.rotateYDegrees
-                // cameraDistance 的默认值是 8 像素,对一个几百像素宽的图层来说相当于把相机贴在
-                // 字面上:稍一转 rotationY 就会有极端的透视畸变,甚至部分转到相机背后出现绘制
-                // 瑕疵。官方建议取"至少跟图层尺寸同量级",这里按画面高度取,画得出透视又不失真。
-                cameraDistance = canvasSize.height * CAMERA_DISTANCE_FACTOR
-            },
-    ) {
-        if (strokeStyle != null) {
-            drawText(
-                textLayoutResult = layoutResult,
-                color = style.strokeColor,
-                topLeft = Offset.Zero,
-                drawStyle = strokeStyle,
-            )
+    private val entries = HashMap<String, Entry>()
+    private var released = false
+
+    /** 上一次按它清理过的活跃列表。活跃列表按桶整体替换,身份变了才需要再清一次。 */
+    private var sweptActive: List<SpecialDanmaku>? = null
+
+    private val strokeStyle: Stroke? = if (style.strokeWidthPx > 0f) {
+        Stroke(width = style.strokeWidthPx, miter = 3f, join = StrokeJoin.Round)
+    } else {
+        null
+    }
+
+    fun beginFrame() {}
+
+    /**
+     * 提前录好即将进场的那些。字符画类视频的几百条常在同一毫秒进场,不提前录就会全部挤进
+     * 进场那一帧;按时间预算分摊到前面的帧,预算用完就留给下一帧。
+     */
+    fun prewarm(active: List<SpecialDanmaku>, positionMillis: Long) {
+        if (released) return
+        val start = TimeSource.Monotonic.markNow()
+        val horizon = positionMillis + PREWARM_LOOKAHEAD_MILLIS
+        for (item in active) {
+            if (item.startTimeMillis > horizon) break
+            if (item.endTimeMillis <= positionMillis || item.id in entries) continue
+            entries[item.id] = create(item)
+            if (start.elapsedNow() >= PREWARM_BUDGET) return
         }
-        // 必须显式传 Fill:两遍共享同一份 TextLayoutResult,省略参数会沿用上一遍设进底层
-        // paragraph 的 Stroke,画出空心字。理由详见 DanmakuHost.drawDanmaku。
-        drawText(textLayoutResult = layoutResult, color = color, topLeft = Offset.Zero, drawStyle = Fill)
+    }
+
+    fun draw(scope: DrawScope, item: SpecialDanmaku, motion: SpecialDanmakuMotion, x: Float, y: Float) {
+        if (released) return
+        val alpha = motion.alpha * style.opacity
+        if (alpha <= 0f) return
+        // 没预热到的当场录:掉一条比多花这一帧糟糕。
+        val entry = entries.getOrPut(item.id) { create(item) }
+        if (entry.alpha != alpha) {
+            entry.layer.alpha = alpha
+            entry.alpha = alpha
+        }
+        scope.translate(x - entry.padPx, y - entry.padPx) {
+            drawLayer(entry.layer)
+        }
+    }
+
+    /** 活跃区间换过之后,释放不在新区间里的图层。 */
+    fun endFrame(active: List<SpecialDanmaku>) {
+        if (released || active === sweptActive) return
+        sweptActive = active
+        val keep = HashSet<String>(active.size * 2)
+        for (item in active) keep += item.id
+        val iterator = entries.entries.iterator()
+        while (iterator.hasNext()) {
+            val (id, entry) = iterator.next()
+            if (id in keep) continue
+            graphicsContext.releaseGraphicsLayer(entry.layer)
+            iterator.remove()
+        }
+    }
+
+    fun release() {
+        if (released) return
+        released = true
+        for (entry in entries.values) graphicsContext.releaseGraphicsLayer(entry.layer)
+        entries.clear()
+    }
+
+    private fun create(item: SpecialDanmaku): Entry {
+        val fontSizePx = item.fontSizeFraction * canvasSize.height
+        val textStyle = style.baseTextStyle.copy(fontSize = with(density) { fontSizePx.toSp() })
+        // 不传约束:一条比画面还宽的弹幕(作者常这么干,让它从画外飞进来)要是被压回画面宽度,
+        // 文字会被迫折行,那是排版被改了,不是位置被改了。
+        val layout = measurer.measure(text = item.text, style = textStyle)
+        val stroke = strokeStyle.takeIf { item.hasStroke }
+        // 描边沿字形轮廓居中,向外溢出半个线宽,录制画布四周留出这圈余量,理由同 DanmakuRenderCache。
+        val pad = if (stroke == null) 0 else ceil(style.strokeWidthPx / 2f).toInt() + 1
+        val layer = graphicsContext.createGraphicsLayer()
+        // 不用 Offscreen:它让 HWUI 为每条留一张持久纹理,实测字符画视频上 RenderThread 没省下,
+        // 主线程反而多出一成,超过 12ms 的帧从 3 个涨到 14 个。
+        layer.compositingStrategy = CompositingStrategy.ModulateAlpha
+        layer.rotationZ = item.rotateZDegrees
+        layer.rotationY = item.rotateYDegrees
+        // cameraDistance 的默认值是 8 像素,对一个几百像素宽的图层来说相当于把相机贴在字面上:
+        // 稍一转 rotationY 就会有极端的透视畸变,甚至部分转到相机背后出现绘制瑕疵。按画面高度取,
+        // 画得出透视又不失真。
+        layer.cameraDistance = canvasSize.height * CAMERA_DISTANCE_FACTOR
+        val topLeft = Offset(pad.toFloat(), pad.toFloat())
+        val color = Color(item.color or ALPHA_OPAQUE_MASK)
+        layer.record(density, layoutDirection, IntSize(layout.size.width + pad * 2, layout.size.height + pad * 2)) {
+            if (stroke != null) {
+                drawText(textLayoutResult = layout, color = style.strokeColor, topLeft = topLeft, drawStyle = stroke)
+            }
+            // 必须显式传 Fill:两遍共享同一份 TextLayoutResult,省略参数会沿用上一遍设进底层
+            // paragraph 的 Stroke,画出空心字。理由详见 DanmakuRenderCache.record。
+            drawText(textLayoutResult = layout, color = color, topLeft = topLeft, drawStyle = Fill)
+        }
+        return Entry(layer, pad.toFloat(), alpha = 1f)
     }
 }
 
 private const val ALPHA_OPAQUE_MASK = 0xFF000000.toInt()
+
+private const val PAUSED_POLL_MILLIS = 100L
+
+/** 预热提前量。比进场早这么久开始录,够几百条同时进场的字符画在前面的帧里分摊完。 */
+private const val PREWARM_LOOKAHEAD_MILLIS = 1_500L
+
+/** 每帧用于预热的时间上限。120Hz 一帧 8.3ms,留给预热的不能超过它的一小半。 */
+private val PREWARM_BUDGET = 3.milliseconds
 
 /** 相机距离取画面高度的这个倍数;2 倍在 1080p 上约 2160px,跟常见 mode 7 实现的透视强度接近。 */
 private const val CAMERA_DISTANCE_FACTOR = 2f
