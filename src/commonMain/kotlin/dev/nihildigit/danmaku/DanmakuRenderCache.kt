@@ -303,7 +303,10 @@ internal class DanmakuRenderCache(
         }
         stats.onLayerReused()
         val pad = padPx.toFloat()
-        scope.translate(x - pad, y - pad) {
+        // 平移取整到整像素。Skia 缓存的文字 blob 只在平移量为整数时复用,滚动弹幕每帧移动
+        // 三点几像素,不取整的话每条每帧都要重建一遍字形子运行。实测不限密度、同屏 250 条时,
+        // RenderThread 上重建这一项从 19% 降到 6%,超过 12ms 的帧从 49 个降到 29 个。
+        scope.translate((x - pad).roundToInt().toFloat(), (y - pad).roundToInt().toFloat()) {
             drawLayer(entry.layer)
         }
     }
