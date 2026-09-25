@@ -17,7 +17,7 @@ plugins {
 group = "dev.nihildigit"
 
 val PROJECT_URL = "https://github.com/NihilDigit/tdanmaku"
-version = "0.2.0"
+version = "0.2.1"
 
 kotlin {
     android {
