@@ -5,11 +5,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.translate
-import androidx.compose.ui.graphics.GraphicsContext
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.layer.drawLayer
-import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.drawText
@@ -40,13 +36,9 @@ import kotlin.math.roundToInt
  *   退回 [baseTextStyle] 自带的字号。
  * @param strokeWidthPx 描边宽度,<= 0 时跳过整条描边绘制(不多画那一遍)。
  * @param strokeColor 描边颜色。
- * @param opacity 弹幕整体不透明度(用户设置项)。它被烤进每条弹幕录制 display list 时的
- *   `drawText` `alpha` 参数,**既不套 `Modifier.alpha`,也不设 `GraphicsLayer.alpha`**:
- *   前者在不透明度 < 1 时强制整个 Canvas 分配全尺寸离屏 buffer;后者在默认
- *   `CompositingStrategy.Auto` 下会把每一条弹幕各自提升成一张离屏缓冲 —— 而这个值默认就
- *   < 1,踩上去等于给同屏几百条弹幕各开一张离屏。详见 [DanmakuRenderCache] 的类注释。
- *   副作用是重叠弹幕会互相透出,不是只显示最上层 —— 这是主流播放器的标准行为,不是这里
- *   引入的 bug。
+ * @param opacity 弹幕整体不透明度(用户设置项)。滚动、顶部、底部弹幕按整条乘在贴图上,描边
+ *   不会从半透明的填充下透出来;重叠的弹幕之间照样互相透出,和主流播放器相同。**不套
+ *   `Modifier.alpha`**:不透明度 < 1 时它强制整个 Canvas 分配全尺寸离屏 buffer。
  */
 data class DanmakuRenderStyle(
     val baseTextStyle: TextStyle = TextStyle.Default,
@@ -58,7 +50,8 @@ data class DanmakuRenderStyle(
 
 /**
  * 渲染侧的缓存统计。和 [ProcessingReport] 分开是分层要求:那份是编排层的产物(纯 stdlib,
- * 要能整体搬进 commonMain),这份记的是平台排版与 display list 的行为,只在渲染层存在。
+ * 要能整体搬进 commonMain),这份记的是平台排版与位图图集的行为,只在渲染层存在。属性名里的
+ * layer 指一条弹幕在图集里的那一块位图。
  *
  * 计数器都是单调累加的,不在帧之间清零 —— 命中率要能跨整段播放看趋势,清零会把"刚 seek 完
  * 那几帧全是未命中"这种最值得看的现象洗掉。唯一的瞬时量是 [liveLayerCount]。
@@ -75,19 +68,19 @@ class DanmakuRenderStats {
     var layoutMissCount: Long = 0L
         private set
 
-    /** 新建 `GraphicsLayer` 并录制 display list 的次数。 */
+    /** 栅格化一条弹幕的次数,含所在页被回收后的重画。 */
     var layerCreatedCount: Long = 0L
         private set
 
-    /** 直接复用已录制 display list 的次数,每帧每条可见弹幕计一次。 */
+    /** 直接贴已有位图的次数,每帧每条可见弹幕计一次。 */
     var layerReusedCount: Long = 0L
         private set
 
-    /** 释放 `GraphicsLayer` 的次数(淘汰 + 整体释放)。泄漏表现为它长期远小于创建数。 */
+    /** 从缓存表里淘汰的条数。位图所占的页由图集整页回收,不在这里计。 */
     var layerReleasedCount: Long = 0L
         private set
 
-    /** 当前还活着的 `GraphicsLayer` 数量。这是瞬时量,不累加。 */
+    /** 缓存表当前的条数。这是瞬时量,不累加。 */
     var liveLayerCount: Int = 0
         private set
 
@@ -147,7 +140,7 @@ class DanmakuRenderStats {
 internal data class DanmakuLayoutKey(val text: String, val style: TextStyle, val images: List<DanmakuImage>)
 
 /**
- * display list 的 key。比 [DanmakuLayoutKey] 多一个颜色(录制时颜色被烤进 display list),
+ * 位图块的 key。比 [DanmakuLayoutKey] 多一个颜色(颜色画进了位图),
  * 少一整个 [TextStyle] —— 因为整个 [DanmakuRenderCache] 本身就是按 style 建的(style 一变
  * 整个缓存重建并释放),缓存内部只可能有一份 baseTextStyle,再把它塞进逐帧查询的 key 里就是
  * 白算一次 [TextStyle.hashCode]。这个哈希不便宜(要走遍 SpanStyle + ParagraphStyle 的几十个
@@ -161,8 +154,11 @@ internal data class DanmakuLayerKey(
 )
 
 /**
- * 按键取图。库不加载图片,只在录制一条弹幕时问一次;返回 null 表示还没到,那条先留空位,之后
- * 每帧再问,到了就重录。
+ * 按键取图。库不加载图片,只在栅格化一条弹幕时问一次;返回 null 表示还没到,那条先留空位,
+ * 之后每帧再问,到了就重画。
+ *
+ * 图要能画进软件画布:弹幕在 CPU 上栅格化进图集。Android 上不能给硬件位图
+ * (`Bitmap.Config.HARDWARE`,Coil 等加载库的默认解码结果),否则栅格化时抛异常。
  */
 fun interface DanmakuImageSource {
     fun imageOrNull(key: String): ImageBitmap?
@@ -193,38 +189,25 @@ internal fun TextMeasurer.layoutDanmaku(danmaku: Danmaku, style: TextStyle): Tex
 }
 
 /**
- * 分级绘制后端的第一、二级(gap 分析 3.4「文字准备与绘制后端」):
+ * 滚动、顶部、底部弹幕的绘制准备,分两级:
  *
  * 1. **prepared layout** —— 弹幕进入预热窗口时测一次,`TextLayoutResult` 存下来。绘制帧
  *    **不调用** [TextMeasurer.measure];真的漏了(刚 seek 完那一两帧)会当场补测并记一次
  *    [DanmakuRenderStats.latePrepareCount],不是把这条弹幕吞掉。
- * 2. **`GraphicsLayer`** —— 把描边和填充两遍 `drawText` 录进一个 display list,之后每帧只做
- *    一次 Canvas 平移 + `drawLayer()`。原先每帧每条要提交两遍文字绘制命令(320 条同屏就是
- *    640 次),现在是一次 RenderNode 引用。
+ * 2. **位图图集** —— 描边、填充、表情图在 CPU 上画进 [DanmakuSpriteAtlas] 的一块,之后每帧
+ *    一次贴图。
  *
- * 第三级 sprite atlas 不做:实测 GPU 只用了 3~5ms,瓶颈不在提交绘制命令那一侧。
+ * 第二级上一版是每条一个 `GraphicsLayer`(一份 display list)。不限密度、同屏 250 条时,
+ * RenderThread 八成以上的时间耗在每帧重画文字、往 Skia 字形图集里补字形,以及每个 RenderNode
+ * 的固定开销上;换成图集后,同一视频同一位置超过 12ms 的帧从 29 个降到 13 个。缘由见
+ * [DanmakuSpriteAtlas]。
  *
- * ### 透明度为什么不设成 layer alpha
+ * 透明度乘在贴图用的 Paint 上,样式变化时整个缓存重建。
  *
- * `GraphicsLayer` 缓存的是 display list,本身不等于离屏位图 —— 但默认
- * `CompositingStrategy.Auto` 下,**layer alpha < 1 必然把它提升为离屏缓冲**。而弹幕不透明度
- * (`DanmakuRenderStyle.opacity`)是用户设置项,默认就 < 1,天真地写 `layer.alpha = opacity`
- * 会给每条弹幕开一张离屏 buffer,比不用 layer 还慢。`CompositingStrategy.ModulateAlpha` 能
- * 绕开离屏,但它改变重叠内容的 alpha 合成结果,而弹幕恰恰重叠(不限密度档下 320 条互相压着)。
- *
- * 所以这里**把 alpha 烤进录制时的绘制命令**(`drawText` 的 `alpha` 参数),layer alpha 保持 1,
- * 样式变化时整个缓存重建重录。这样画出来和"直接往 Canvas 上画"逐像素一致 —— 重叠的弹幕照样
- * 互相透出,和主流播放器行为相同。**不要"顺手简化"成 `layer.alpha = style.opacity`**,那一行
- * 改动看着等价,代价是每条弹幕一张离屏缓冲。
- *
- * ### 生命周期
- *
- * 每个 [GraphicsLayer] 都占显存里的一份 display list,必须还给 [GraphicsContext]。淘汰走
- * [endFrame],整体走 [release];调用方要用 `DisposableEffect` 保证 [release] 一定被调到。
+ * 调用方要用 `DisposableEffect` 保证 [release] 一定被调到。
  */
 internal class DanmakuRenderCache(
     private val measurer: TextMeasurer,
-    private val graphicsContext: GraphicsContext,
     private val density: Density,
     private val layoutDirection: LayoutDirection,
     private val style: DanmakuRenderStyle,
@@ -241,9 +224,9 @@ internal class DanmakuRenderCache(
     }
 
     /**
-     * 录制画布四周的余量。[Stroke] 沿字形轮廓**居中**描,向外溢出半个线宽,而 display list 的
-     * 尺寸是按文字 bounds 报的 —— 不留余量的话,底层 RenderNode 一旦按自己的边界裁剪,描边的
-     * 外半边就没了。留一圈之后录制时把文字画在 `(pad, pad)`,绘制时反向平移回去,位置不变。
+     * 位图块四周的余量。[Stroke] 沿字形轮廓**居中**描,向外溢出半个线宽,而排版尺寸是按文字
+     * bounds 报的 —— 不留余量的话,描边的外半边会被块的边界裁掉。留一圈之后栅格化时把文字画在
+     * `(pad, pad)`,贴图时反向平移回去,位置不变。
      */
     private val padPx: Int = if (strokeStyle == null) 0 else ceil(style.strokeWidthPx / 2f).toInt() + 1
 
@@ -257,9 +240,12 @@ internal class DanmakuRenderCache(
     private var frameId = 0L
     private var released = false
 
-    /** [imagesPending] 为真时,录制那一刻有图还没到,[draw] 每帧检查一次,到齐就重录。 */
+    private val atlas = DanmakuSpriteAtlas(density, layoutDirection)
+    private val spritePaint = atlas.paint(style.opacity)
+
+    /** [imagesPending] 为真时,栅格化那一刻有图还没到,[draw] 每帧检查一次,到齐就重画。 */
     private class LayerEntry(
-        val layer: GraphicsLayer,
+        var slot: DanmakuSpriteAtlas.Slot,
         var lastUsedFrame: Long,
         val danmaku: Danmaku,
         var imagesPending: Boolean,
@@ -271,7 +257,7 @@ internal class DanmakuRenderCache(
     }
 
     /**
-     * 准备一条弹幕:排版 + 录制 display list。已经准备过就只更新 LRU 位置。
+     * 准备一条弹幕:排版 + 栅格化进图集。已经准备过就只更新 LRU 位置。
      * 返回是否发生了真实的准备工作,预热循环用它扣预算。
      */
     fun prepare(danmaku: Danmaku): Boolean {
@@ -298,17 +284,19 @@ internal class DanmakuRenderCache(
             create(key, danmaku)
         }
         entry.lastUsedFrame = frameId
-        if (entry.imagesPending && entry.danmaku.validImages().all { imageSource.imageOrNull(it.key) != null }) {
-            entry.imagesPending = record(entry.layer, layoutOf(entry.danmaku), entry.danmaku)
+        if (!entry.slot.valid) {
+            // 所在的页被回收了(长时间没画,又回到了屏上,比如回退 seek)。
+            val layout = layoutOf(entry.danmaku)
+            entry.slot = allocate(layout)
+            entry.imagesPending = rasterize(entry.slot, layout, entry.danmaku)
+            stats.onLayerCreated(layers.size)
+        } else if (entry.imagesPending && entry.danmaku.validImages().all { imageSource.imageOrNull(it.key) != null }) {
+            entry.imagesPending = rasterize(entry.slot, layoutOf(entry.danmaku), entry.danmaku)
         }
         stats.onLayerReused()
-        val pad = padPx.toFloat()
-        // 平移取整到整像素。Skia 缓存的文字 blob 只在平移量为整数时复用,滚动弹幕每帧移动
-        // 三点几像素,不取整的话每条每帧都要重建一遍字形子运行。实测不限密度、同屏 250 条时,
-        // RenderThread 上重建这一项从 19% 降到 6%,超过 12ms 的帧从 49 个降到 29 个。
-        scope.translate((x - pad).roundToInt().toFloat(), (y - pad).roundToInt().toFloat()) {
-            drawLayer(entry.layer)
-        }
+        atlas.touch(entry.slot, frameId)
+        // 贴到整像素上:位图一比一贴,落在小数像素上就要插值,字会发虚。
+        atlas.draw(scope, entry.slot, (x - padPx).roundToInt(), (y - padPx).roundToInt(), spritePaint)
     }
 
     /** 绘制一帧的结束:把超出上限的条目淘汰掉。本帧用过的绝不回收。 */
@@ -317,52 +305,50 @@ internal class DanmakuRenderCache(
         trimLayouts()
     }
 
-    /** 释放全部 [GraphicsLayer]。调用后这个实例不再可用。 */
+    /** 放掉图集。调用后这个实例不再可用。 */
     fun release() {
         if (released) return
         released = true
-        for (entry in layers.values) {
-            graphicsContext.releaseGraphicsLayer(entry.layer)
-            stats.onLayerReleased(0)
-        }
         layers.clear()
         layouts.clear()
         styleByFontSize.clear()
+        atlas.release()
     }
 
     private fun create(key: DanmakuLayerKey, danmaku: Danmaku): LayerEntry {
         val layout = layoutOf(danmaku)
-        val layer = graphicsContext.createGraphicsLayer()
-        val pending = record(layer, layout, danmaku)
-        val entry = LayerEntry(layer, frameId, danmaku, pending)
+        val slot = allocate(layout)
+        val pending = rasterize(slot, layout, danmaku)
+        val entry = LayerEntry(slot, frameId, danmaku, pending)
         layers[key] = entry
         stats.onLayerCreated(layers.size)
         return entry
     }
 
+    private fun allocate(layout: TextLayoutResult): DanmakuSpriteAtlas.Slot =
+        atlas.allocate(layout.size.width + padPx * 2, layout.size.height + padPx * 2, frameId)
+
     /**
-     * 录制描边 + 填充两遍。
+     * 画描边 + 填充两遍,再画表情图。返回是否有图还没到。
      *
      * **第二遍必须显式传 `drawStyle = Fill`,不能省略。** `drawText` 的 `drawStyle` 默认值是
      * `null`,语义是"不覆盖底层 paragraph 已经设过的绘制方式",不是"用 Fill" —— 两遍共享同一份
      * [TextLayoutResult],第一遍把 `Stroke` 设进了底层 paragraph,第二遍不传就会继续描边,
      * 肉眼看是空心字。凡是共享 [TextLayoutResult] 做多遍绘制的地方都有这个坑。
      */
-    private fun record(layer: GraphicsLayer, layout: TextLayoutResult, danmaku: Danmaku): Boolean {
-        val size = IntSize(layout.size.width + padPx * 2, layout.size.height + padPx * 2)
+    private fun rasterize(slot: DanmakuSpriteAtlas.Slot, layout: TextLayoutResult, danmaku: Danmaku): Boolean {
         val topLeft = Offset(padPx.toFloat(), padPx.toFloat())
         val stroke = strokeStyle
         // danmaku.color 是不带 alpha 的 24 位 RGB,直接塞进 Color(Int) 会被当成 0x00RRGGBB
         // (alpha=0,全透明),必须先把 alpha 字节填满。
         val color = Color(danmaku.color or ALPHA_OPAQUE_MASK)
         var imagesPending = false
-        layer.record(density, layoutDirection, size) {
+        atlas.render(slot) {
             if (stroke != null) {
                 drawText(
                     textLayoutResult = layout,
                     color = style.strokeColor,
                     topLeft = topLeft,
-                    alpha = style.opacity,
                     drawStyle = stroke,
                 )
             }
@@ -370,7 +356,6 @@ internal class DanmakuRenderCache(
                 textLayoutResult = layout,
                 color = color,
                 topLeft = topLeft,
-                alpha = style.opacity,
                 drawStyle = Fill,
             )
             // 图画在占位上,不描边:描边是给文字在任意底色上保持可读的,图自带轮廓。
@@ -385,7 +370,6 @@ internal class DanmakuRenderCache(
                     image = bitmap,
                     dstOffset = IntOffset((rect.left + topLeft.x).roundToInt(), (rect.top + topLeft.y).roundToInt()),
                     dstSize = IntSize(rect.width.roundToInt(), rect.height.roundToInt()),
-                    alpha = style.opacity,
                 )
             }
         }
@@ -411,15 +395,14 @@ internal class DanmakuRenderCache(
             val entry = iterator.next().value
             // 本帧画过的不能回收:上限低于同屏条数时才会撞到这条,那时宁可暂时超限。
             if (entry.lastUsedFrame >= frameId) continue
-            graphicsContext.releaseGraphicsLayer(entry.layer)
             iterator.remove()
             stats.onLayerReleased(layers.size)
         }
     }
 
     /**
-     * 排版表按纯 LRU 淘汰,不看帧号:被淘汰的 [TextLayoutResult] 如果还有 display list 在用,
-     * 那份 display list 早就录完了,不再需要排版对象 —— 淘汰只意味着下次同文本要重测一次。
+     * 排版表按纯 LRU 淘汰,不看帧号:位图画好之后就不再需要排版对象 —— 淘汰只意味着下次同
+     * 文本要重测一次。
      */
     private fun trimLayouts() {
         if (layouts.size <= maxLayouts) return
@@ -432,9 +415,9 @@ internal class DanmakuRenderCache(
 
     companion object {
         /**
-         * display list 上限。要明显大于峰值同屏条数(实测 1264×2780 面板、不限密度档的峰值是
-         * 320),否则每帧都在淘汰刚画过的东西 —— 那比不缓存还糟。预热窗口里还有一批未上屏的,
-         * 所以按峰值的一倍多给。display list 存的是绘制命令不是位图,单条很小。
+         * 缓存表上限。要明显大于峰值同屏条数(实测 1264×2780 面板、不限密度档的峰值是 320),
+         * 否则每帧都在淘汰刚画过的东西。预热窗口里还有一批未上屏的,所以按峰值的一倍多给。表项
+         * 只是图集里一块位置的引用,位图的内存由图集的页数上限管。
          */
         const val MAX_LAYERS = 768
 

@@ -15,7 +15,6 @@ import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalGraphicsContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.preferredFrameRate
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -147,8 +146,8 @@ class DanmakuHostState(
     val layout: DanmakuLayoutConfig get() = timeline.layout
 
     /**
-     * 遍历 `positionMillis` 时刻会在屏的弹幕。渲染层拿它做**预热**:提前一两秒把文字排版和
-     * display list 准备好,好让绘制帧一次测量都不做。
+     * 遍历 `positionMillis` 时刻会在屏的弹幕。渲染层拿它做**预热**:提前一两秒把文字排版并
+     * 画进图集,好让绘制帧一次测量都不做。
      *
      * 和 [run] 的帧回调分开是因为两者问的是不同的问题 —— 帧回调问"现在画什么",这里问"马上
      * 要用到什么"。把预热塞进帧回调的 `visible` 列表里做不到:那个列表按定义只含已经在屏的,
@@ -252,13 +251,12 @@ class DanmakuHostState(
  *   [DanmakuLayoutConfig.bottomTrackFraction]。
  *
  * **绘制帧里没有文字排版,也没有文字绘制命令。** 排版和"描边 + 填充"两遍 `drawText` 都发生在
- * 弹幕进入预热窗口的那一次,结果录进 [DanmakuRenderCache] 持有的 display list;每帧对每条可见
- * 弹幕只做一次平移 + `drawLayer`。上一版是每帧每条查一次 `TextMeasurer` 缓存再提交两遍
- * `drawText`,320 条同屏就是 320 次缓存查询 + 640 次绘制命令,实测主线程每帧约 10ms
- * (120Hz 的预算是 8.3ms),而同期 GPU 只用了 3~5ms —— 瓶颈在提交侧,不在填充率侧。
+ * 弹幕进入预热窗口的那一次,结果画进 [DanmakuRenderCache] 持有的位图图集;每帧对每条可见弹幕
+ * 只贴一次图。上一版是每帧每条查一次 `TextMeasurer` 缓存再提交两遍 `drawText`,320 条同屏就是
+ * 320 次缓存查询 + 640 次绘制命令,实测主线程每帧约 10ms(120Hz 的预算是 8.3ms)。
  *
- * @param renderStats 传进来就能观测缓存行为(命中/未命中、layer 创建/复用/回收);不传就内部
- *   自己建一份,统计照常发生,只是没人读。
+ * @param renderStats 传进来就能观测缓存行为(排版命中/未命中、位图的栅格化/复用/淘汰);不传就
+ *   内部自己建一份,统计照常发生,只是没人读。
  * @param imageSource [Danmaku.images] 的图从这里取。
  */
 @Composable
@@ -273,7 +271,6 @@ fun DanmakuHost(
     // 这个 measurer 只在准备阶段用,每条文本最多进来一次,自带的 LRU 已经不是热路径 ——
     // 真正的排版缓存是 DanmakuRenderCache 里那张按 (文本, 解析后 TextStyle) 建的表。
     val measurer = rememberTextMeasurer()
-    val graphicsContext = LocalGraphicsContext.current
     val density = LocalDensity.current
     val layoutDirection = LocalLayoutDirection.current
     // remember 无条件调用再取,不写成 `renderStats ?: remember { ... }` —— 那样 remember 会被
@@ -281,12 +278,11 @@ fun DanmakuHost(
     val fallbackStats = remember { DanmakuRenderStats() }
     val stats = renderStats ?: fallbackStats
 
-    // 缓存挂在样式和 density 上:字号、字体、颜色兜底、描边、不透明度任一变化,已录的
-    // display list 全部作废(alpha 是烤进去的,见 DanmakuRenderCache 的类注释)。
-    val cache = remember(measurer, graphicsContext, density, layoutDirection, style, stats, imageSource) {
-        DanmakuRenderCache(measurer, graphicsContext, density, layoutDirection, style, stats, imageSource)
+    // 缓存挂在样式和 density 上:字号、字体、颜色兜底、描边、不透明度任一变化,已画的位图全部作废。
+    val cache = remember(measurer, density, layoutDirection, style, stats, imageSource) {
+        DanmakuRenderCache(measurer, density, layoutDirection, style, stats, imageSource)
     }
-    // GraphicsLayer 不还回去就是显存泄漏。remember 换实例和离开组合两条路都要走到 release,
+    // 图集的页要及时放掉。remember 换实例和离开组合两条路都要走到 release,
     // DisposableEffect(cache) 两者都覆盖:key 变化时先 onDispose 旧的。
     DisposableEffect(cache) {
         onDispose { cache.release() }
@@ -380,9 +376,12 @@ fun DanmakuHost(
  * 预热驱动。每隔 [PREWARM_INTERVAL_MILLIS] 播放时间往前看 [PREWARM_LOOKAHEAD_MILLIS],把那时会
  * 在屏的弹幕提前准备好。
  *
- * 有预算上限是因为准备工作(排版 + 录制 display list)是主线程活儿:一次把上百条全准备了,
+ * 有预算上限是因为准备工作(排版 + 栅格化进图集)是主线程活儿:一次把上百条全准备了,
  * 省下的每帧成本会以一个几十毫秒的尖峰还回去,直方图上就是一个新的丢帧。分摊到多帧做,窗口
  * 有一两秒的余量,来得及。
+ *
+ * 按间隔成批做而不是每帧做一点,还因为图集的页每改一次平台就整页重传一次:同一批写进同一页,
+ * 一批只传一次。
  *
  * 用播放时间而不是帧数做节流,是因为倍速播放时"多久之后上屏"跟着倍速走,而帧数不跟。
  */
