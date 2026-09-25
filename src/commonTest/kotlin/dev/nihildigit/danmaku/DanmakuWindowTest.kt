@@ -125,7 +125,8 @@ class DanmakuWindowTest {
             second.advanceTo(60_037L)
 
             // 只比两个窗口都必然盖到的那一段:尾部边界差 37ms,可能多带一条,那不算不一致。
-            val cut = 80_000L
+            // 窗口只往落点之后预留几秒,比较段不能超过它。
+            val cut = 62_000L
             assertEquals(
                 first.timeline.plans().filter { it.emitTimeMillis <= cut },
                 second.timeline.plans().filter { it.emitTimeMillis <= cut },
@@ -155,6 +156,38 @@ class DanmakuWindowTest {
         val outside = measured.filter { it.playTimeMillis < 600_000L - slack || it.playTimeMillis > 600_000L + 30_000L + slack }
         assertEquals(emptyList<Danmaku>(), outside, "窗口外被测量了 ${outside.size} 条")
         assertTrue(measured.size < pool.size / 10, "测量量没降下来:${measured.size} / ${pool.size}")
+    }
+
+    /**
+     * 免测量丢弃只能省测量,不能改结果。池子要密到大半被丢,否则这条路径根本没走到。改速度
+     * 模型破坏了"越宽越快"的单调性时,这里会先红。
+     */
+    @Test
+    fun `免测量丢弃与逐条测量的排布相同`() {
+        val cfg = layout()
+        val pool = randomPool(6_000, spanMillis = 60_000L, seed = 23)
+
+        var measuredWithSkip = 0
+        val withSkip = DanmakuCompiler(cfg, CollisionFreeScheduler(cfg)) {
+            measuredWithSkip++
+            size(it.text)
+        }
+        withSkip.setPool(pool)
+        withSkip.compileAll()
+
+        val alwaysMeasure = object : DanmakuScheduler by CollisionFreeScheduler(cfg) {
+            override fun rejectsRegardlessOfSize(danmaku: Danmaku) = false
+        }
+        val reference = DanmakuCompiler(cfg, alwaysMeasure) { size(it.text) }
+        reference.setPool(pool)
+        reference.compileAll()
+
+        assertEquals(reference.timeline.plans(), withSkip.timeline.plans())
+        assertEquals(reference.report.droppedByLayoutCount, withSkip.report.droppedByLayoutCount)
+        assertTrue(
+            measuredWithSkip < pool.size / 2,
+            "丢弃了 ${withSkip.report.droppedByLayoutCount} 条,却测了 $measuredWithSkip / ${pool.size} 条",
+        )
     }
 
     // ---- 保不住、但必须仍然成立的两条 ----

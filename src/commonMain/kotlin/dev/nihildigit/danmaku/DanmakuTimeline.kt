@@ -321,7 +321,11 @@ class DanmakuCompiler(
         var dropped = 0
         while (nextIndex < pool.size && pool[nextIndex].playTimeMillis <= untilMillis) {
             val danmaku = pool[nextIndex]
-            val plan = scheduler.schedule(danmaku, measure(danmaku), sequences[nextIndex])
+            val plan = if (scheduler.rejectsRegardlessOfSize(danmaku)) {
+                null
+            } else {
+                scheduler.schedule(danmaku, measure(danmaku), sequences[nextIndex])
+            }
             if (plan == null) {
                 dropped++
             } else {
@@ -353,11 +357,13 @@ class DanmakuCompiler(
 
     private companion object {
         /**
-         * 窗口预留长度。30 秒足够盖住两次 [advanceTo] 之间的播放(调用方按秒级推进),同时把
-         * 一次重建的测量量压在几百条量级——密度最高的池子(9457 条/20 分钟)在这个跨度里也只有
-         * 两三百条。
+         * 窗口预留长度。要盖住两次 [advanceTo] 之间的播放,外加渲染层的预热提前量(1.5 秒)。
+         *
+         * 曾经是 30 秒,配每秒一次的推进。真机上一段每秒一百多条的视频,那一秒的弹幕要在同一
+         * 帧里测完,120Hz 下每秒掉一帧;seek 之后的重建更要测 D + 30 秒的量,一次卡三百毫秒。
+         * 现在推进提到每 100ms 一次,预留量只需几秒。
          */
-        const val DEFAULT_LOOK_AHEAD_MILLIS = 30_000L
+        const val DEFAULT_LOOK_AHEAD_MILLIS = 3_000L
 
         /** 窗口起点的对齐粒度,见 [windowOriginFor]。 */
         const val WINDOW_ORIGIN_GRID_MILLIS = 4_000L

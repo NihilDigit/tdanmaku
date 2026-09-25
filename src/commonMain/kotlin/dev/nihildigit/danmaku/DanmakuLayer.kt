@@ -247,8 +247,8 @@ fun rememberDanmakuController(
  */
 @Composable
 fun DanmakuLayer(controller: DanmakuController, modifier: Modifier = Modifier) {
-    // 编排窗口跟着播放位置往前推。每秒一次即可:窗口预留 30 秒,一秒的播放推进只会带进几条。
-    // seek 不靠这个循环兜,那要等最坏一秒 —— 调用方在 seek 时调 notifyChanged。
+    // 编排窗口跟着播放位置往前推。推进得勤,每次要测的就少:密集段落每秒上百条,攒一秒再测会在
+    // 一帧里花掉整帧的预算。seek 不靠这个循环兜 —— 调用方在 seek 时调 notifyChanged。
     LaunchedEffect(controller) {
         while (true) {
             delay(WINDOW_ADVANCE_INTERVAL_MILLIS)
@@ -275,5 +275,5 @@ fun DanmakuLayer(controller: DanmakuController, modifier: Modifier = Modifier) {
     }
 }
 
-/** 窗口推进间隔。只需要远小于窗口预留量(30 秒),不必贴着帧率。 */
-private const val WINDOW_ADVANCE_INTERVAL_MILLIS = 1_000L
+/** 窗口推进间隔。要远小于窗口预留量减去预热提前量(3 - 1.5 秒),不必贴着帧率。 */
+private const val WINDOW_ADVANCE_INTERVAL_MILLIS = 100L

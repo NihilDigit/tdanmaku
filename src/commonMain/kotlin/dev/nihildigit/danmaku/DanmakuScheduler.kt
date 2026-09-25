@@ -53,6 +53,15 @@ interface DanmakuScheduler {
      */
     fun schedule(danmaku: Danmaku, size: DanmakuTextSize, sequence: Int): DanmakuFlightPlan?
 
+    /**
+     * 不看尺寸就能断定 [schedule] 会返回 null 时返回 true,调用方据此跳过测量。
+     *
+     * 这是纯粹的省测量手段,**不能改变结果**:返回 true 的弹幕交给 [schedule] 也必须被丢弃,
+     * 且不改动轨道状态。拿不准就返回 false。密集段落里被丢弃的占八成以上,而测量是编排里最贵
+     * 的一步。
+     */
+    fun rejectsRegardlessOfSize(danmaku: Danmaku): Boolean = false
+
     /** 清空轨道状态,回到"空轨道"的起点。窗口重建走这条路。 */
     fun reset()
 }
@@ -203,11 +212,34 @@ class CollisionFreeScheduler(private val layout: DanmakuLayoutConfig) : DanmakuS
         DanmakuMode.BOTTOM -> scheduleFixed(danmaku, size, bottomEndMillis, bottomUsed)
     }
 
+    /**
+     * 速度随字宽单调不减(`speed = (W + 虚拟宽) / D`),slack 随速度单调不增,所以按零宽的
+     * 速度都没有一条轨道放得下,任何宽度都放不下。固定弹幕的占用本来就与字宽无关。改速度
+     * 模型时(比如给速度加 clamp 或独立扰动)这条推理要重新成立,否则这里会多丢弹幕。
+     */
+    override fun rejectsRegardlessOfSize(danmaku: Danmaku): Boolean = when (danmaku.mode) {
+        DanmakuMode.SCROLL -> {
+            val slowest = scrollMotion(danmaku, ZERO_SIZE, layout).speed
+            firstScrollTrack(danmaku.playTimeMillis, slowest) < 0
+        }
+        DanmakuMode.TOP -> firstFixedTrack(danmaku.playTimeMillis, topEndMillis, topUsed) < 0
+        DanmakuMode.BOTTOM -> firstFixedTrack(danmaku.playTimeMillis, bottomEndMillis, bottomUsed) < 0
+    }
+
     private fun scheduleScroll(danmaku: Danmaku, size: DanmakuTextSize): DanmakuFlightPlan? {
         val motion = scrollMotion(danmaku, size, layout)
         val t = danmaku.playTimeMillis
-        val limit = layout.viewportPx.width - layout.minGapPx
+        val track = firstScrollTrack(t, motion.speed)
+        if (track < 0) return null
+        scrollLastEmitMillis[track] = t
+        scrollLastSpeed[track] = motion.speed
+        scrollUsed[track] = true
+        return scrollPlan(danmaku, size, layout, track, motion)
+    }
 
+    /** 自上而下第一条 slack >= 0 的滚动轨道,没有返回 -1。只读,不改状态。 */
+    private fun firstScrollTrack(t: Long, speed: Float): Int {
+        val limit = layout.viewportPx.width - layout.minGapPx
         for (track in 0 until layout.scrollTrackCount) {
             // 这两条分支必须给出相同的 slack:"没用过"和"用过但 remaining 已归零"在判据上
             // 不可区分,窗口化编排(见 [DanmakuCompiler])正是靠这一点才能丢掉 D 毫秒之前的
@@ -217,15 +249,10 @@ class CollisionFreeScheduler(private val layout: DanmakuLayoutConfig) : DanmakuS
             } else {
                 0L
             }
-            val slack = limit - max(scrollLastSpeed[track], motion.speed) * remaining
-            if (slack < 0f) continue
-
-            scrollLastEmitMillis[track] = t
-            scrollLastSpeed[track] = motion.speed
-            scrollUsed[track] = true
-            return scrollPlan(danmaku, size, layout, track, motion)
+            val slack = limit - max(scrollLastSpeed[track], speed) * remaining
+            if (slack >= 0f) return track
         }
-        return null
+        return -1
     }
 
     /** 固定弹幕是区间调度、first-fit:常规观感就是从最靠边那条开始往里填。 */
@@ -236,13 +263,22 @@ class CollisionFreeScheduler(private val layout: DanmakuLayoutConfig) : DanmakuS
         used: BooleanArray,
     ): DanmakuFlightPlan? {
         val t = danmaku.playTimeMillis
+        val track = firstFixedTrack(t, endMillis, used)
+        if (track < 0) return null
+        endMillis[track] = t + layout.fixedDurationMillis
+        used[track] = true
+        return fixedPlan(danmaku, size, layout, track)
+    }
+
+    private fun firstFixedTrack(t: Long, endMillis: LongArray, used: BooleanArray): Int {
         for (track in endMillis.indices) {
-            if (used[track] && t < endMillis[track]) continue
-            endMillis[track] = t + layout.fixedDurationMillis
-            used[track] = true
-            return fixedPlan(danmaku, size, layout, track)
+            if (!used[track] || t >= endMillis[track]) return track
         }
-        return null
+        return -1
+    }
+
+    private companion object {
+        val ZERO_SIZE = DanmakuTextSize(0f, 0f)
     }
 }
 
