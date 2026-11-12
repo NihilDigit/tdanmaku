@@ -17,7 +17,7 @@ plugins {
 group = "dev.nihildigit"
 
 val PROJECT_URL = "https://github.com/NihilDigit/tdanmaku"
-version = "0.2.1"
+version = "0.2.2"
 
 kotlin {
     android {
@@ -147,7 +147,10 @@ val cleanCentralBundle by tasks.registering(Delete::class) {
 }
 
 tasks.withType<PublishToMavenRepository>().configureEach {
-    if (repository?.name == "centralBundle") dependsOn(cleanCentralBundle)
+    // 按任务名匹配而非读 `repository?.name`:KMP 在 afterEvaluate 里追加 target publication 时,
+    // PublishingPlugin 先建任务触发这里的 configureEach、随后才给 repository 赋值,读属性会拿到 null,
+    // 导致后注册的 target 任务漏挂 dependsOn 抢跑在 cleanCentralBundle 之前、写出的制品被随后的清理删掉。
+    if (name.endsWith("ToCentralBundleRepository")) dependsOn(cleanCentralBundle)
 }
 
 /**
