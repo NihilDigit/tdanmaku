@@ -2,11 +2,12 @@ package dev.nihildigit.danmaku
 
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.GraphicsContext
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.Placeholder
@@ -124,6 +125,10 @@ class DanmakuRenderStats {
         latePrepareCount++
     }
 
+    internal fun onCacheCleared() {
+        liveLayerCount = 0
+    }
+
     override fun toString(): String =
         "DanmakuRenderStats(layout hit=$layoutHitCount miss=$layoutMissCount rate=$layoutHitRate, " +
             "layer created=$layerCreatedCount reused=$layerReusedCount released=$layerReleasedCount " +
@@ -145,13 +150,50 @@ internal data class DanmakuLayoutKey(val text: String, val style: TextStyle, val
  * 整个缓存重建并释放),缓存内部只可能有一份 baseTextStyle,再把它塞进逐帧查询的 key 里就是
  * 白算一次 [TextStyle.hashCode]。这个哈希不便宜(要走遍 SpanStyle + ParagraphStyle 的几十个
  * 字段),而这个 key 是每帧每条弹幕都要算一次的东西,320 条同屏时那点开销正是我们要省的。
+ *
+ * 字号按 [Float.toBits] 编码成原始 `Int`([NO_FONT_SIZE_BITS] 表示 `null`),避免在每帧探测路径上为
+ * `Float?` 装箱分配 `java.lang.Float`;[DanmakuRenderCache] 在单线程内复用同一个探测实例调 [set],
+ * 真正入表时才调 [snapshot] 留存独立副本,从而把命中帧的 key 分配降为零。
  */
-internal data class DanmakuLayerKey(
-    val text: String,
-    val fontSizeSp: Float?,
-    val colorRgb: Int,
-    val images: List<DanmakuImage>,
-)
+internal class DanmakuLayerKey(
+    var text: String = "",
+    var fontSizeSpBits: Int = NO_FONT_SIZE_BITS,
+    var colorRgb: Int = 0,
+    var images: List<DanmakuImage> = emptyList(),
+) {
+    val fontSizeSp: Float?
+        get() = if (fontSizeSpBits == NO_FONT_SIZE_BITS) null else Float.fromBits(fontSizeSpBits)
+
+    fun set(danmaku: Danmaku, style: DanmakuRenderStyle): DanmakuLayerKey {
+        text = danmaku.text
+        fontSizeSpBits = fontSizeSpBitsOf(danmaku, style)
+        colorRgb = danmaku.color
+        images = if (danmaku.images.isEmpty()) emptyList() else danmaku.validImages()
+        return this
+    }
+
+    fun snapshot(): DanmakuLayerKey = DanmakuLayerKey(text, fontSizeSpBits, colorRgb, images)
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is DanmakuLayerKey) return false
+        return colorRgb == other.colorRgb &&
+            fontSizeSpBits == other.fontSizeSpBits &&
+            text == other.text &&
+            images == other.images
+    }
+
+    override fun hashCode(): Int {
+        var result = text.hashCode()
+        result = 31 * result + fontSizeSpBits
+        result = 31 * result + colorRgb
+        result = 31 * result + images.hashCode()
+        return result
+    }
+
+    override fun toString(): String =
+        "DanmakuLayerKey(text=$text, fontSizeSp=$fontSizeSp, colorRgb=$colorRgb, images=$images)"
+}
 
 /**
  * 按键取图。库不加载图片,只在栅格化一条弹幕时问一次;返回 null 表示还没到,那条先留空位,
@@ -208,6 +250,7 @@ internal fun TextMeasurer.layoutDanmaku(danmaku: Danmaku, style: TextStyle): Tex
  */
 internal class DanmakuRenderCache(
     private val measurer: TextMeasurer,
+    graphicsContext: GraphicsContext,
     private val density: Density,
     private val layoutDirection: LayoutDirection,
     private val style: DanmakuRenderStyle,
@@ -233,15 +276,20 @@ internal class DanmakuRenderCache(
     /** 按字号缓存解析后的 [TextStyle]。字号实际只有几档,这张表最多几个条目。 */
     private val styleByFontSize = HashMap<Float, TextStyle>()
 
-    // 查询即"最近使用",淘汰从表头开始 —— 靠 [getAndTouch] 维持,见那里的注释。
-    private val layouts = LinkedHashMap<DanmakuLayoutKey, TextLayoutResult>(INITIAL_CAPACITY, LOAD_FACTOR)
-    private val layers = LinkedHashMap<DanmakuLayerKey, LayerEntry>(INITIAL_CAPACITY, LOAD_FACTOR)
+    // 查询即"最近使用",淘汰从表头开始 —— 靠自链双链表 [LruCacheMap] 维持,命中路径零分配。
+    private val layouts = LruCacheMap<DanmakuLayoutKey, TextLayoutResult>(INITIAL_CAPACITY, LOAD_FACTOR)
+    private val layers = LruCacheMap<DanmakuLayerKey, LayerEntry>(INITIAL_CAPACITY, LOAD_FACTOR)
+
+    /** 仅用于单线程查询探测的可变 key;入表时必须调 [DanmakuLayerKey.snapshot] 存独立副本。 */
+    private val lookupKey = DanmakuLayerKey()
+
+    /** [beginFrame] 为当帧可见列表预先解析好的条目槽位,供 [drawPrepared] 按下标 O(1) 读取。 */
+    private val frameEntries = ArrayList<LayerEntry?>(INITIAL_CAPACITY)
 
     private var frameId = 0L
     private var released = false
 
-    private val atlas = DanmakuSpriteAtlas(density, layoutDirection)
-    private val spritePaint = atlas.paint(style.opacity)
+    private val atlas = DanmakuSpriteAtlas(graphicsContext, density, layoutDirection, style.opacity)
 
     /** [imagesPending] 为真时,栅格化那一刻有图还没到,[draw] 每帧检查一次,到齐就重画。 */
     private class LayerEntry(
@@ -251,25 +299,94 @@ internal class DanmakuRenderCache(
         var imagesPending: Boolean,
     )
 
-    /** 绘制一帧的开始。帧号是[endFrame] 判断"这条本帧还在用、不能回收"的依据。 */
-    fun beginFrame() {
+    /**
+     * 预热前先把当前同屏弹幕占用的页打上新一轮保护戳,防止预热分配新槽位时把本帧马上要画的页当成
+     * 旧页回收掉。
+     */
+    fun protectVisible(visible: List<DanmakuFlightPlan>) {
+        if (released) return
         frameId++
+        markSlotsUsed(visible)
     }
 
     /**
-     * 准备一条弹幕:排版 + 栅格化进图集。已经准备过就只更新 LRU 位置。
-     * 返回是否发生了真实的准备工作,预热循环用它扣预算。
+     * 绘制一帧的开始。帧号是 [endFrame] 判断"这条本帧还在用、不能回收"的依据。
+     *
+     * 传入本帧可见列表时,第一遍先按零分配探测保护已有槽位并顺手缓存命中项,第二遍仅针对未命中或
+     * 待重画的少数条目补录,最后一次性把脏页录制进各自的页图层 —— 命中弹幕整帧只做一次哈希查找,
+     * 后续 [drawPrepared] 直接按下标 O(1) 贴图。
+     */
+    fun beginFrame(visible: List<DanmakuFlightPlan> = emptyList()) {
+        if (released) return
+        frameId++
+        frameEntries.clear()
+        val count = visible.size
+        if (count > 0) {
+            frameEntries.ensureCapacity(count)
+            for (i in 0 until count) {
+                val entry = layers.getAndTouch(lookupKey.set(visible[i].danmaku, style))
+                if (entry != null) {
+                    entry.lastUsedFrame = frameId
+                    if (entry.slot.valid) {
+                        atlas.touch(entry.slot, frameId)
+                    }
+                }
+                frameEntries.add(entry)
+            }
+            for (i in 0 until count) {
+                val existing = frameEntries[i]
+                if (existing != null && existing.slot.valid && !existing.imagesPending) continue
+                frameEntries[i] = ensureReady(visible[i].danmaku)
+            }
+        }
+        atlas.syncDirtyPages()
+    }
+
+    /**
+     * 准备一条弹幕:排版 + 栅格化进图集。已经准备过且所在页仍有效时只更新缓存与页的活跃帧号;
+     * 所在页曾被图集整页回收时当场重画,不在进场那一帧才落进 [draw] 补录。
+     * 返回是否发生了真实的栅格化工作,预热循环用它扣预算。
      */
     fun prepare(danmaku: Danmaku): Boolean {
         if (released) return false
-        val key = layerKeyOf(danmaku, style)
-        val existing = layers.getAndTouch(key)
+        val existing = layers.getAndTouch(lookupKey.set(danmaku, style))
         if (existing != null) {
             existing.lastUsedFrame = frameId
-            return false
+            if (existing.slot.valid) {
+                atlas.touch(existing.slot, frameId)
+                return false
+            }
+            val layout = layoutOf(existing.danmaku)
+            val (newSlot, pending) = allocateAndRasterize(layout, existing.danmaku)
+            replaceSlot(existing, newSlot)
+            existing.imagesPending = pending
+            stats.onLayerCreated(layers.size)
+            return true
         }
-        create(key, danmaku)
+        create(lookupKey.snapshot(), danmaku)
         return true
+    }
+
+    /** 按 [beginFrame] 已准备好的可见列表下标直接贴图,不再重复构造 key 或查表。 */
+    fun drawPrepared(scope: DrawScope, visibleIndex: Int, x: Float, y: Float) {
+        if (released) return
+        val entry = frameEntries.getOrNull(visibleIndex) ?: return
+        stats.onLayerReused()
+        atlas.draw(scope, entry.slot, x - padPx, y - padPx)
+    }
+
+    /** 当前可见列表中是否存在"上次栅格化时缺图、而此刻图片已全部就绪"的条目,供暂停轮询决定是否补画。 */
+    fun hasReadyPendingImages(visible: List<DanmakuFlightPlan>): Boolean {
+        if (released) return false
+        for (i in 0 until visible.size) {
+            val danmaku = visible[i].danmaku
+            if (danmaku.images.isEmpty()) continue
+            val entry = layers[lookupKey.set(danmaku, style)] ?: continue
+            if (entry.imagesPending && entry.danmaku.validImages().all { imageSource.imageOrNull(it.key) != null }) {
+                return true
+            }
+        }
+        return false
     }
 
     /**
@@ -278,51 +395,91 @@ internal class DanmakuRenderCache(
      */
     fun draw(scope: DrawScope, danmaku: Danmaku, x: Float, y: Float) {
         if (released) return
-        val key = layerKeyOf(danmaku, style)
-        val entry = layers.getAndTouch(key) ?: run {
-            stats.onLatePrepare()
-            create(key, danmaku)
-        }
-        entry.lastUsedFrame = frameId
-        if (!entry.slot.valid) {
-            // 所在的页被回收了(长时间没画,又回到了屏上,比如回退 seek)。
-            val layout = layoutOf(entry.danmaku)
-            entry.slot = allocate(layout)
-            entry.imagesPending = rasterize(entry.slot, layout, entry.danmaku)
-            stats.onLayerCreated(layers.size)
-        } else if (entry.imagesPending && entry.danmaku.validImages().all { imageSource.imageOrNull(it.key) != null }) {
-            entry.imagesPending = rasterize(entry.slot, layoutOf(entry.danmaku), entry.danmaku)
-        }
+        val entry = ensureReady(danmaku)
         stats.onLayerReused()
-        atlas.touch(entry.slot, frameId)
-        // 贴到整像素上:位图一比一贴,落在小数像素上就要插值,字会发虚。
-        atlas.draw(scope, entry.slot, (x - padPx).roundToInt(), (y - padPx).roundToInt(), spritePaint)
+        atlas.draw(scope, entry.slot, x - padPx, y - padPx)
     }
 
     /** 绘制一帧的结束:把超出上限的条目淘汰掉。本帧用过的绝不回收。 */
     fun endFrame() {
+        frameEntries.clear()
         trimLayers()
         trimLayouts()
     }
 
-    /** 放掉图集。调用后这个实例不再可用。 */
+    /** 放掉图集及所有非池化超宽页图层。调用后这个实例不再可用。 */
     fun release() {
         if (released) return
         released = true
+        frameEntries.clear()
+        layers.forEachValue { entry ->
+            atlas.releaseUnpooled(entry.slot)
+        }
         layers.clear()
         layouts.clear()
         styleByFontSize.clear()
+        stats.onCacheCleared()
         atlas.release()
+    }
+
+    private fun markSlotsUsed(visible: List<DanmakuFlightPlan>) {
+        for (i in 0 until visible.size) {
+            val entry = layers[lookupKey.set(visible[i].danmaku, style)] ?: continue
+            if (entry.slot.valid) {
+                entry.lastUsedFrame = frameId
+                atlas.touch(entry.slot, frameId)
+            }
+        }
+    }
+
+    private fun ensureReady(danmaku: Danmaku): LayerEntry {
+        val entry = layers.getAndTouch(lookupKey.set(danmaku, style)) ?: run {
+            val permanentKey = lookupKey.snapshot()
+            stats.onLatePrepare()
+            create(permanentKey, danmaku)
+        }
+        entry.lastUsedFrame = frameId
+        if (!entry.slot.valid) {
+            // 所在的页被回收且未被预热重画(如刚回退 seek 那一两帧):当场补录并记入 latePrepare。
+            stats.onLatePrepare()
+            val layout = layoutOf(entry.danmaku)
+            val (newSlot, pending) = allocateAndRasterize(layout, entry.danmaku)
+            replaceSlot(entry, newSlot)
+            entry.imagesPending = pending
+            stats.onLayerCreated(layers.size)
+        } else if (entry.imagesPending && entry.danmaku.validImages().all { imageSource.imageOrNull(it.key) != null }) {
+            entry.imagesPending = rasterize(entry.slot, layoutOf(entry.danmaku), entry.danmaku)
+            stats.onLayerCreated(layers.size)
+        }
+        atlas.touch(entry.slot, frameId)
+        return entry
+    }
+
+    private fun replaceSlot(entry: LayerEntry, newSlot: DanmakuSpriteAtlas.Slot) {
+        atlas.releaseUnpooled(entry.slot)
+        entry.slot = newSlot
     }
 
     private fun create(key: DanmakuLayerKey, danmaku: Danmaku): LayerEntry {
         val layout = layoutOf(danmaku)
-        val slot = allocate(layout)
-        val pending = rasterize(slot, layout, danmaku)
+        val (slot, pending) = allocateAndRasterize(layout, danmaku)
         val entry = LayerEntry(slot, frameId, danmaku, pending)
         layers[key] = entry
         stats.onLayerCreated(layers.size)
         return entry
+    }
+
+    private fun allocateAndRasterize(
+        layout: TextLayoutResult,
+        danmaku: Danmaku,
+    ): Pair<DanmakuSpriteAtlas.Slot, Boolean> {
+        val slot = allocate(layout)
+        try {
+            return slot to rasterize(slot, layout, danmaku)
+        } catch (t: Throwable) {
+            atlas.releaseUnpooled(slot)
+            throw t
+        }
     }
 
     private fun allocate(layout: TextLayoutResult): DanmakuSpriteAtlas.Slot =
@@ -390,13 +547,17 @@ internal class DanmakuRenderCache(
 
     private fun trimLayers() {
         if (layers.size <= maxLayers) return
-        val iterator = layers.entries.iterator()
-        while (iterator.hasNext() && layers.size > maxLayers) {
-            val entry = iterator.next().value
+        var node = layers.head
+        while (node != null && layers.size > maxLayers) {
+            val next = node.next
+            val entry = node.value
             // 本帧画过的不能回收:上限低于同屏条数时才会撞到这条,那时宁可暂时超限。
-            if (entry.lastUsedFrame >= frameId) continue
-            iterator.remove()
-            stats.onLayerReleased(layers.size)
+            if (entry.lastUsedFrame < frameId) {
+                atlas.releaseUnpooled(entry.slot)
+                layers.removeNode(node)
+                stats.onLayerReleased(layers.size)
+            }
+            node = next
         }
     }
 
@@ -405,11 +566,9 @@ internal class DanmakuRenderCache(
      * 文本要重测一次。
      */
     private fun trimLayouts() {
-        if (layouts.size <= maxLayouts) return
-        val iterator = layouts.keys.iterator()
-        while (iterator.hasNext() && layouts.size > maxLayouts) {
-            iterator.next()
-            iterator.remove()
+        while (layouts.size > maxLayouts) {
+            val eldest = layouts.head ?: break
+            layouts.removeNode(eldest)
         }
     }
 
@@ -431,23 +590,130 @@ internal class DanmakuRenderCache(
 }
 
 /**
- * 取值,并把这条移到插入顺序的尾部 —— 于是"尾部最新、头部最旧",淘汰照旧从头扫。
+ * 零分配命中的 LRU 表。
  *
- * JVM 上这件事本来由 `java.util.LinkedHashMap(capacity, loadFactor, accessOrder = true)` 做,
- * 但那个三参构造是 `java.util` 专有的,commonMain 里不存在:Kotlin 的 [LinkedHashMap] 只承诺
- * 插入顺序,而且对已存在的 key 再 `put` 一次不会改变它的位置,所以必须先 `remove` 再 `put`。
- *
- * 代价是命中路径上多一次哈希查找。这条路径每帧每条弹幕走一次,实测远小于它省下的一次重排版。
+ * Kotlin `commonMain` 的 [LinkedHashMap] 没有 `accessOrder = true` 构造,旧实现靠 `remove + put`
+ * 把命中项挪到表尾 —— 那意味着每帧每条可见弹幕都要做两次哈希查找并新建一个链表节点。这里用
+ * [HashMap] 存自链双链表节点:纯查询 [get] 与带刷新的 [getAndTouch] 都只做一次哈希查找、原地重挂
+ * 四个引用,命中路径零堆分配;淘汰从 [head] 顺序往后扫,连迭代器也不必分配。
  */
-private fun <K, V> LinkedHashMap<K, V>.getAndTouch(key: K): V? {
-    val value = remove(key) ?: return null
-    put(key, value)
-    return value
+internal class LruCacheMap<K, V>(
+    initialCapacity: Int = 128,
+    loadFactor: Float = 0.75f,
+) {
+    internal class Node<K, V>(
+        val key: K,
+        var value: V,
+    ) {
+        var prev: Node<K, V>? = null
+        var next: Node<K, V>? = null
+    }
+
+    private val map = HashMap<K, Node<K, V>>(initialCapacity, loadFactor)
+
+    var head: Node<K, V>? = null
+        private set
+    var tail: Node<K, V>? = null
+        private set
+
+    val size: Int get() = map.size
+
+    operator fun get(key: K): V? = map[key]?.value
+
+    fun getAndTouch(key: K): V? {
+        val node = map[key] ?: return null
+        moveToTail(node)
+        return node.value
+    }
+
+    operator fun set(key: K, value: V) {
+        val existing = map[key]
+        if (existing != null) {
+            existing.value = value
+            moveToTail(existing)
+            return
+        }
+        val node = Node(key, value)
+        appendToTail(node)
+        map[key] = node
+    }
+
+    fun removeNode(node: Node<K, V>) {
+        val removed = map.remove(node.key) ?: return
+        if (removed !== node) {
+            map[removed.key] = removed
+            return
+        }
+        unlink(node)
+    }
+
+    inline fun forEachValue(action: (V) -> Unit) {
+        var current = head
+        while (current != null) {
+            val next = current.next
+            action(current.value)
+            current = next
+        }
+    }
+
+    fun clear() {
+        map.clear()
+        head = null
+        tail = null
+    }
+
+    private fun moveToTail(node: Node<K, V>) {
+        if (node === tail) return
+        unlink(node)
+        appendToTail(node)
+    }
+
+    private fun appendToTail(node: Node<K, V>) {
+        val oldTail = tail
+        node.prev = oldTail
+        node.next = null
+        if (oldTail != null) {
+            oldTail.next = node
+        } else {
+            head = node
+        }
+        tail = node
+    }
+
+    private fun unlink(node: Node<K, V>) {
+        val p = node.prev
+        val n = node.next
+        if (p != null) {
+            p.next = n
+        } else {
+            head = n
+        }
+        if (n != null) {
+            n.prev = p
+        } else {
+            tail = p
+        }
+        node.prev = null
+        node.next = null
+    }
 }
+
+/**
+ * `Float.toBits()` 会把所有 `NaN` 归并到规范位模式 `0x7fc00000`,因此 `-1`(`0xFFFFFFFF`)在任意
+ * 合法 `Float` 上都不可能出现,可安全充当"未显式指定字号"的哨兵而无需装箱成 `Float?`。
+ */
+private const val NO_FONT_SIZE_BITS = -1
 
 /** 弹幕自身字号优先,其次全局字号,都没有就回落到 `baseTextStyle` 自带的字号(返回 null)。 */
 internal fun fontSizeSpOf(danmaku: Danmaku, style: DanmakuRenderStyle): Float? =
     danmaku.fontSize?.toFloat() ?: style.globalFontSizeSp
+
+internal fun fontSizeSpBitsOf(danmaku: Danmaku, style: DanmakuRenderStyle): Int {
+    val perDanmaku = danmaku.fontSize
+    if (perDanmaku != null) return perDanmaku.toFloat().toBits()
+    val global = style.globalFontSizeSp
+    return if (global != null) global.toBits() else NO_FONT_SIZE_BITS
+}
 
 /**
  * 解析出这条弹幕真正用来排版的 [TextStyle]。[styleByFontSize] 是可选的复用表:`copy` 本身不贵,
@@ -472,4 +738,4 @@ internal fun layoutKeyOf(
     DanmakuLayoutKey(danmaku.text, resolvedTextStyleOf(danmaku, style, styleByFontSize), danmaku.validImages())
 
 internal fun layerKeyOf(danmaku: Danmaku, style: DanmakuRenderStyle): DanmakuLayerKey =
-    DanmakuLayerKey(danmaku.text, fontSizeSpOf(danmaku, style), danmaku.color, danmaku.validImages())
+    DanmakuLayerKey().set(danmaku, style)

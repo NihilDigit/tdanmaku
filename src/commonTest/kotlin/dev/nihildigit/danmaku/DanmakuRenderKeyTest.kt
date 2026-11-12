@@ -7,6 +7,7 @@ import androidx.compose.ui.text.intl.LocaleList
 import androidx.compose.ui.unit.sp
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNull
 import kotlin.test.Test
 
 /**
@@ -70,5 +71,77 @@ class DanmakuRenderKeyTest {
         assertNotEquals(baseKey, layoutKeyOf(d, family))
         assertNotEquals(baseKey, layoutKeyOf(d, weight))
         assertNotEquals(baseKey, layoutKeyOf(d, locale))
+    }
+
+    @Test
+    fun `reusable probe key matches snapshot and stays isolated after mutation`() {
+        val styleWithGlobal = DanmakuRenderStyle(globalFontSizeSp = 18f)
+        val styleWithoutGlobal = DanmakuRenderStyle(globalFontSizeSp = null)
+        val first = danmaku("前方高能", color = 0x66CCFF)
+        val second = danmaku("完结撒花", color = 0xFF0000, fontSize = 25)
+
+        val probe = DanmakuLayerKey().set(first, styleWithGlobal)
+        val snapshot = probe.snapshot()
+        assertEquals(snapshot, probe)
+        assertEquals(snapshot.hashCode(), probe.hashCode())
+        assertEquals(18f, snapshot.fontSizeSp)
+
+        // 复用探测实例去查下一条弹幕时,已入表的快照绝不能跟着变。
+        probe.set(second, styleWithoutGlobal)
+        assertNotEquals(snapshot, probe)
+        assertEquals("前方高能", snapshot.text)
+        assertEquals(18f, snapshot.fontSizeSp)
+        assertEquals(25f, probe.fontSizeSp)
+
+        // 未指定字号(null)与任意显式字号(含 0f / -0f / NaN)都必须可区分且哈希自洽。
+        val unset = layerKeyOf(first, styleWithoutGlobal)
+        assertNull(unset.fontSizeSp)
+        assertNotEquals(unset, layerKeyOf(first, DanmakuRenderStyle(globalFontSizeSp = 0f)))
+        assertNotEquals(unset, layerKeyOf(first, DanmakuRenderStyle(globalFontSizeSp = Float.NaN)))
+    }
+
+    @Test
+    fun `lru cache map touches hit entries and evicts eldest without losing links`() {
+        val cache = LruCacheMap<DanmakuLayerKey, String>(initialCapacity = 4)
+        val style = DanmakuRenderStyle(globalFontSizeSp = 18f)
+        val k1 = layerKeyOf(danmaku("一"), style)
+        val k2 = layerKeyOf(danmaku("二"), style)
+        val k3 = layerKeyOf(danmaku("三"), style)
+        val probe = DanmakuLayerKey()
+
+        cache[k1] = "1"
+        cache[k2] = "2"
+        cache[k3] = "3"
+        assertEquals(3, cache.size)
+        assertEquals("1", cache.head?.value)
+        assertEquals("3", cache.tail?.value)
+
+        // 纯查询 get 不改变顺序;getAndTouch 把 k1 挪到表尾,使 k2 成为最旧项。
+        assertEquals("1", cache[probe.set(danmaku("一"), style)])
+        assertEquals("1", cache.head?.value)
+        assertEquals("1", cache.getAndTouch(probe.set(danmaku("一"), style)))
+        assertEquals("2", cache.head?.value)
+        assertEquals("1", cache.tail?.value)
+
+        // 更新已有 key 的值同样刷新到表尾。
+        cache[k2] = "2-updated"
+        assertEquals("3", cache.head?.value)
+        assertEquals("2-updated", cache.tail?.value)
+
+        // 依次淘汰表头、表尾与最后一项,双向链表指针始终闭合。
+        cache.removeNode(cache.head!!)
+        assertEquals(2, cache.size)
+        assertNull(cache[k3])
+        assertEquals("1", cache.head?.value)
+
+        cache.removeNode(cache.tail!!)
+        assertEquals(1, cache.size)
+        assertEquals("1", cache.head?.value)
+        assertEquals("1", cache.tail?.value)
+
+        cache.clear()
+        assertEquals(0, cache.size)
+        assertNull(cache.head)
+        assertNull(cache.tail)
     }
 }
