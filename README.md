@@ -53,9 +53,11 @@ The library owns text measurement and canvas geometry. The measurer and the rend
 the same `DanmakuOptions`, so layout and painting agree on the width of a comment by construction;
 the layer reads its own canvas size and recompiles when it changes.
 
-Call `controller.notifyChanged()` after a seek or a speed change. The frame loop suspends while
-nothing is visible and observes only the clock, so external events reach it through that call. A
-fallback poll bounds the delay when the call is omitted.
+Call `controller.notifyDiscontinuity()` after a seek, pause or resume, and
+`controller.notifyChanged()` after a speed change. The frame loop suspends while nothing is visible
+and observes only the clock, so external events reach it through those calls; `notifyDiscontinuity`
+also resets the smoothed clock so a short pause or jump is not filtered as drift. A fallback poll
+bounds the delay when a call is omitted.
 
 ## How it works
 

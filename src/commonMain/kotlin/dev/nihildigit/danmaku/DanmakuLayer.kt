@@ -194,12 +194,24 @@ class DanmakuController internal constructor(
     fun trimBefore(positionMillis: Long): Int = session.compiler.trimBefore(positionMillis)
 
     /**
-     * 叫醒帧循环。屏上没有可见弹幕时循环会挂起,而 seek、恢复播放、变速这些外部事件它看不见 ——
+     * 叫醒帧循环(用于倍速变化等连续状态变化)。屏上没有可见弹幕时循环会挂起,外部事件它看不见 ——
      * 不调也不会永远卡住(有兜底轮询),只是响应会迟到那么一下。
      */
     fun notifyChanged() {
         session.compiler.advanceTo(clock.positionMillis)
         session.hostState.notifyChanged()
+        specialState.notifyChanged()
+    }
+
+    /**
+     * 通知播放时间不连续(暂停/恢复、seek、切集重播):重置时钟滤波状态,推进编排窗口并唤醒帧循环。
+     * 注意:弹幕池扩展与倍速变化走 [notifyChanged],不要走这里,否则会打断变速过渡期的平滑追赶。
+     */
+    fun notifyDiscontinuity() {
+        clock.onDiscontinuity()
+        session.compiler.advanceTo(clock.positionMillis)
+        session.hostState.notifyDiscontinuity()
+        specialState.notifyChanged()
     }
 
     /** 编排统计,给日志用。窗口内的,不是整池的。 */

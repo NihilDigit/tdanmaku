@@ -5,8 +5,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -36,9 +36,11 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 位移插值方式。只有这两种是因为数据源(B 站 mode 7)只表达得出这两种,不是这一层的能力上限。
@@ -131,26 +133,34 @@ data class SpecialDanmakuMotion(
  * **没有逐条动画状态。** 整条弹幕是时间的纯函数,求一次就出结果,seek、变速、暂停因此不需要
  * 任何同步逻辑。
  */
-fun SpecialDanmaku.motionAt(playTimeMillis: Long): SpecialDanmakuMotion? {
-    if (durationMillis <= 0L) return null
+fun SpecialDanmaku.motionAt(playTimeMillis: Long): SpecialDanmakuMotion? =
+    motionAt(playTimeMillis.toDouble())
+
+internal fun SpecialDanmaku.isAliveAt(playTimeMillis: Double): Boolean {
+    if (!playTimeMillis.isFinite() || durationMillis <= 0L) return false
     val elapsed = playTimeMillis - startTimeMillis
-    if (elapsed < 0L || elapsed >= durationMillis) return null
+    return elapsed >= 0.0 && elapsed < durationMillis
+}
+
+internal fun SpecialDanmaku.motionAt(playTimeMillis: Double): SpecialDanmakuMotion? {
+    if (!isAliveAt(playTimeMillis)) return null
+    val elapsed = playTimeMillis - startTimeMillis
 
     val moved = elapsed - translationDelayMillis
     val rawProgress = when {
-        moved < 0L -> 0f
+        moved < 0.0 -> 0f
         // 顺序不能跟下一条对调:位移时长为 0 时,延迟结束那一刻(moved == 0)就该在终点,
         // 按 `moved >= duration` 判也得到 1,但除法会先炸。
         translationDurationMillis <= 0L -> 1f
         moved >= translationDurationMillis -> 1f
-        else -> moved.toFloat() / translationDurationMillis
+        else -> (moved / translationDurationMillis).toFloat()
     }
     val progress = when (easing) {
         SpecialDanmakuEasing.LINEAR -> rawProgress
         SpecialDanmakuEasing.EASE_IN_CUBIC -> rawProgress * rawProgress * rawProgress
     }
 
-    val alphaProgress = elapsed.toFloat() / durationMillis
+    val alphaProgress = (elapsed / durationMillis).toFloat()
     return SpecialDanmakuMotion(
         x = lerp(fromX, toX, progress),
         y = lerp(fromY, toY, progress),
@@ -172,6 +182,8 @@ private fun lerp(from: Float, to: Float, progress: Float): Float = from + (to - 
 @Stable
 class SpecialDanmakuHostState(internal val clock: DanmakuClock) {
 
+    private val wake = Channel<Unit>(capacity = Channel.CONFLATED)
+
     // 委托属性不能带自定义 setter(Kotlin 的限制),所以拆成后备属性 + 手写访问器。
     private var poolState by mutableStateOf<List<SpecialDanmaku>>(emptyList())
 
@@ -188,7 +200,17 @@ class SpecialDanmakuHostState(internal val clock: DanmakuClock) {
             // 显示的全部消失,下一帧帧循环才恢复。表现就是高级弹幕每次重组闪一下。
             // refreshActive() 本来就按当前桶重算,不需要任何强制。
             refreshActive()
+            wake.trySend(Unit)
         }
+
+    /** 通知暂停态挂起中的帧循环立即醒来重检时钟(如恢复播放、暂停态 seek)。 */
+    fun notifyChanged() {
+        wake.trySend(Unit)
+    }
+
+    internal suspend fun awaitWakeUp(timeoutMillis: Long) {
+        withTimeoutOrNull(timeoutMillis) { wake.receive() }
+    }
 
     /**
      * 当前时间附近可能在屏的那些,**不是整池**。绘制和预热都只扫这一段。
@@ -208,6 +230,50 @@ class SpecialDanmakuHostState(internal val clock: DanmakuClock) {
         activeBucket = bucket
         refreshActive()
         return true
+    }
+
+    /** 按采样时刻更新活跃分桶并填充当前可见列表,不分配 [SpecialDanmakuMotion]。 */
+    internal fun collectVisibleAt(playTimeMillis: Double, out: MutableList<SpecialDanmaku>) {
+        out.clear()
+        if (!playTimeMillis.isFinite()) return
+        onPositionChanged(floor(playTimeMillis).toLong())
+        val active = activeDanmaku
+        for (i in 0 until active.size) {
+            val item = active[i]
+            if (item.isAliveAt(playTimeMillis)) {
+                out.add(item)
+            }
+        }
+    }
+
+    /**
+     * 当前无可见弹幕且预热窗口内条目已全部备齐时,下一次需要唤醒帧循环的播放位置(用于上屏或开启下一轮预热)。
+     * 返回 `null` 表示当前时刻之后整池已无待上屏的高级弹幕。
+     */
+    internal fun nextWakePositionMillis(playTimeMillis: Double, prewarmLookaheadMillis: Long): Long? {
+        if (!playTimeMillis.isFinite()) return null
+        val pool = poolState
+        if (pool.isEmpty()) return null
+        val baseMillis = floor(playTimeMillis).toLong()
+            .coerceAtMost(Long.MAX_VALUE - prewarmLookaheadMillis - 1L)
+        val nextShow = pool.firstValidFrom(pool.lowerBoundByStart(baseMillis + 1L)) ?: return null
+        val prewarmHorizon = baseMillis + prewarmLookaheadMillis
+        val nextPrewarm = pool.firstValidFrom(pool.lowerBoundByStart(prewarmHorizon + 1L))
+            ?: return nextShow.startTimeMillis
+        return minOf(nextShow.startTimeMillis, nextPrewarm.startTimeMillis - prewarmLookaheadMillis)
+    }
+
+    internal fun computeIdleDelayMillis(playTimeMillis: Double, prewarmLookaheadMillis: Long): Long {
+        if (!clock.isPlaying) return PAUSED_POLL_MILLIS
+        val speed = clock.playbackSpeed.coerceAtLeast(MIN_PLAYBACK_SPEED).toDouble()
+        val nextWakePos = nextWakePositionMillis(playTimeMillis, prewarmLookaheadMillis)
+            ?: return IDLE_POLL_FALLBACK_MILLIS
+        val remainingPlayMillis = nextWakePos - playTimeMillis
+        val leadPlayMillis = VSYNC_LEAD_MILLIS * speed
+        if (remainingPlayMillis <= leadPlayMillis) return 0L
+        return ceil((remainingPlayMillis - leadPlayMillis) / speed)
+            .toLong()
+            .coerceIn(1L, IDLE_POLL_FALLBACK_MILLIS)
     }
 
     private fun refreshActive() {
@@ -241,6 +307,14 @@ private fun List<SpecialDanmaku>.lowerBoundByStart(target: Long): Int {
 private fun List<SpecialDanmaku>.isSortedByStart(): Boolean {
     for (i in 1 until size) if (this[i - 1].startTimeMillis > this[i].startTimeMillis) return false
     return true
+}
+
+private fun List<SpecialDanmaku>.firstValidFrom(startIndex: Int): SpecialDanmaku? {
+    for (i in startIndex until size) {
+        val item = this[i]
+        if (item.durationMillis > 0L) return item
+    }
+    return null
 }
 
 /**
@@ -295,27 +369,78 @@ fun SpecialDanmakuHost(
         onDispose { cache.release() }
     }
 
-    var framePositionMillis by remember { mutableLongStateOf(0L) }
+    // Canvas 只消费与 framePositionMillis 同一次采样产出的可见快照,不直接读 state.activeDanmaku,
+    // 防止"当前采样无可见弹幕而不更新 framePositionMillis,但 Canvas 拿旧时间扫新候选列表误画出已过期弹幕"。
+    val visibleItems = remember(state) { mutableListOf<SpecialDanmaku>() }
+    var framePositionMillis by remember(state) { mutableDoubleStateOf(0.0) }
     var frameVersion by remember { mutableIntStateOf(0) }
 
     // 列表为空时不跑帧循环。绝大多数视频一条 mode 7 都没有,那种情况下这一层应该完全不产生
     // 每帧工作量。
     LaunchedEffect(state, hasContent, cache) {
-        if (!hasContent) return@LaunchedEffect
-        var lastPosition = Long.MIN_VALUE
+        if (!hasContent) {
+            cache.clearEntries()
+            if (visibleItems.isNotEmpty()) {
+                visibleItems.clear()
+                frameVersion++
+            }
+            return@LaunchedEffect
+        }
+        val nextVisible = ArrayList<SpecialDanmaku>()
+        var lastPosition = Double.NaN
+        var lastPool: List<SpecialDanmaku>? = null
+        var pausedSettled = false
+        var pausedClockMillis = Long.MIN_VALUE
         while (true) {
-            val now = withFrameNanos { state.clock.positionAtFrame(it) }
-            if (now == lastPosition && !state.clock.isPlaying) {
-                // 暂停时画面不变,不必每个 vsync 都要一帧;恢复播放最多迟到这一个间隔。
-                delay(PAUSED_POLL_MILLIS)
+            val currentPool = state.danmaku
+            if (state.clock.isPlaying) {
+                pausedSettled = false
+            } else if (pausedSettled && currentPool === lastPool && state.clock.positionMillis == pausedClockMillis) {
+                // 暂停且画面已定格时直接挂起等通知或兜底超时,不注册 withFrameNanos,避免桌面端
+                // Skiko 被每 100ms 唤醒跑一轮无意义的合成与交换链。
+                state.awaitWakeUp(PAUSED_POLL_MILLIS)
                 continue
             }
+            val now = withFrameNanos { state.clock.precisePositionAtFrame(it) }
+            if (!now.isFinite()) {
+                state.awaitWakeUp(PAUSED_POLL_MILLIS)
+                continue
+            }
+            val playingNow = state.clock.isPlaying
+            if (!playingNow) {
+                pausedSettled = true
+                pausedClockMillis = state.clock.positionMillis
+                if (now == lastPosition && currentPool === lastPool) {
+                    state.awaitWakeUp(PAUSED_POLL_MILLIS)
+                    continue
+                }
+            } else {
+                pausedSettled = false
+            }
             lastPosition = now
-            // 跨桶才重算活跃区间,见 SpecialDanmakuHostState.activeDanmaku。
-            state.onPositionChanged(now)
-            cache.prewarm(state.activeDanmaku, now)
-            framePositionMillis = now
-            frameVersion++
+            lastPool = currentPool
+
+            state.collectVisibleAt(now, nextVisible)
+            val active = state.activeDanmaku
+            val prewarmComplete = cache.prewarm(active, floor(now).toLong())
+            cache.endFrame(active)
+
+            val hadVisible = visibleItems.isNotEmpty()
+            if (nextVisible.isNotEmpty() || hadVisible) {
+                visibleItems.clear()
+                visibleItems.addAll(nextVisible)
+                framePositionMillis = now
+                frameVersion++
+            }
+
+            // 播放中但当前屏上无可见高级弹幕、上一帧也已清空且预热窗口内已备齐时,直接挂起到下一条的
+            // 预热/进场时刻(或池更新/seek 通知),避免整段空档期每帧注册 withFrameNanos 驱动交换链空转。
+            if (playingNow && nextVisible.isEmpty() && !hadVisible && prewarmComplete) {
+                val idleDelayMillis = state.computeIdleDelayMillis(now, PREWARM_LOOKAHEAD_MILLIS)
+                if (idleDelayMillis > 0L) {
+                    state.awaitWakeUp(idleDelayMillis)
+                }
+            }
         }
     }
 
@@ -327,14 +452,14 @@ fun SpecialDanmakuHost(
         @Suppress("UNUSED_EXPRESSION")
         frameVersion
 
-        if (canvasSize.width == 0 || canvasSize.height == 0) return@Canvas
+        if (canvasSize.width == 0 || canvasSize.height == 0 || visibleItems.isEmpty()) return@Canvas
         cache.beginFrame()
-        for (item in state.activeDanmaku) {
+        for (i in 0 until visibleItems.size) {
+            val item = visibleItems[i]
             val motion = item.motionAt(framePositionMillis) ?: continue
             // 归一化坐标指的是文字**左上角**在画布上的落点,不是中心。
             cache.draw(this, item, motion, motion.x * size.width, motion.y * size.height)
         }
-        cache.endFrame(state.activeDanmaku)
     }
 }
 
@@ -370,18 +495,19 @@ internal class SpecialDanmakuRenderCache(
 
     /**
      * 提前录好即将进场的那些。字符画类视频的几百条常在同一毫秒进场,不提前录就会全部挤进
-     * 进场那一帧;按时间预算分摊到前面的帧,预算用完就留给下一帧。
+     * 进场那一帧;按时间预算分摊到前面的帧,预算用完返回 `false` 留给下一帧接着录,全部备齐返回 `true`。
      */
-    fun prewarm(active: List<SpecialDanmaku>, positionMillis: Long) {
-        if (released) return
+    fun prewarm(active: List<SpecialDanmaku>, positionMillis: Long): Boolean {
+        if (released || canvasSize.width <= 0 || canvasSize.height <= 0) return true
         val start = TimeSource.Monotonic.markNow()
         val horizon = positionMillis + PREWARM_LOOKAHEAD_MILLIS
         for (item in active) {
             if (item.startTimeMillis > horizon) break
             if (item.endTimeMillis <= positionMillis || item.id in entries) continue
             entries[item.id] = create(item)
-            if (start.elapsedNow() >= PREWARM_BUDGET) return
+            if (start.elapsedNow() >= PREWARM_BUDGET) return false
         }
+        return true
     }
 
     fun draw(scope: DrawScope, item: SpecialDanmaku, motion: SpecialDanmakuMotion, x: Float, y: Float) {
@@ -414,11 +540,17 @@ internal class SpecialDanmakuRenderCache(
         }
     }
 
+    fun clearEntries() {
+        sweptActive = null
+        if (entries.isEmpty()) return
+        for (entry in entries.values) graphicsContext.releaseGraphicsLayer(entry.layer)
+        entries.clear()
+    }
+
     fun release() {
         if (released) return
         released = true
-        for (entry in entries.values) graphicsContext.releaseGraphicsLayer(entry.layer)
-        entries.clear()
+        clearEntries()
     }
 
     private fun create(item: SpecialDanmaku): Entry {
@@ -457,6 +589,11 @@ internal class SpecialDanmakuRenderCache(
 private const val ALPHA_OPAQUE_MASK = 0xFF000000.toInt()
 
 private const val PAUSED_POLL_MILLIS = 100L
+private const val IDLE_POLL_FALLBACK_MILLIS = 500L
+private const val MIN_PLAYBACK_SPEED = 0.01f
+
+/** 距离下一条进场/预热不足这一窗口时不再 delay,切回 vsync 采样以保证亚毫秒级准点进场。 */
+private const val VSYNC_LEAD_MILLIS = 20.0
 
 /** 预热提前量。比进场早这么久开始录,够几百条同时进场的字符画在前面的帧里分摊完。 */
 private const val PREWARM_LOOKAHEAD_MILLIS = 1_500L

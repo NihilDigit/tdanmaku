@@ -62,4 +62,53 @@ class FrameDeadlineSchedulerTest {
 
         assertTrue(drawn <= 61, "挂起归来后连出了 $drawn 帧,把空档当成了欠账")
     }
+
+    @Test
+    fun `60Hz 唤醒时刻抖动下不会退化成 30fps`() {
+        val periodNanos = 1_000_000_000.0 / 60.0
+        // 同时验证首帧零偏移和首帧非零相位(+1.6ms 先到、下一帧 -1.6ms 后到)两种常见桌面端 EDT/D3D 抖动。
+        val jitterPatterns = listOf(
+            longArrayOf(0L, -1_600_000L, 1_500_000L, -1_200_000L, 1_400_000L, -900_000L, 800_000L),
+            longArrayOf(1_600_000L, -1_600_000L, 1_500_000L, -1_500_000L, 1_200_000L, -1_200_000L),
+        )
+        val totalFrames = 600
+        for (pattern in jitterPatterns) {
+            val scheduler = FrameDeadlineScheduler(DanmakuFrameRateCap.FPS_60.frameIntervalNanos)
+            val drawn = (0 until totalFrames).count { index ->
+                val ideal = (index * periodNanos).toLong()
+                val jitter = pattern[index % pattern.size]
+                scheduler.shouldDraw(ideal + jitter)
+            }
+            assertEquals(totalFrames, drawn, "60Hz 带 ±1.6ms 抖动时漏帧: $drawn / $totalFrames")
+        }
+    }
+
+    @Test
+    fun `偶发掉帧后跨过过期刻度且不连续补帧`() {
+        val period144 = (1_000_000_000.0 / 144.0).toLong()
+        // 覆盖 30ms(刚跨过 1.8 个周期的中等卡顿)与 45ms(跨过 2.7 个周期)两档掉帧,
+        // 恢复后的紧邻 144Hz vsync(仅隔 6.94ms)绝不能为了偿还旧网格立刻双连画。
+        for (hiccupNanos in listOf(30_000_000L, 45_000_000L)) {
+            val scheduler = FrameDeadlineScheduler(DanmakuFrameRateCap.FPS_60.frameIntervalNanos)
+            assertTrue(scheduler.shouldDraw(0L))
+            assertTrue(scheduler.shouldDraw(hiccupNanos))
+            assertEquals(false, scheduler.shouldDraw(hiccupNanos + period144), "${hiccupNanos / 1_000_000}ms 卡顿后发生了紧邻补帧")
+        }
+    }
+
+    @Test
+    fun `重复帧时间戳与极值边界安全处理`() {
+        val scheduler = FrameDeadlineScheduler(DanmakuFrameRateCap.FPS_60.frameIntervalNanos)
+        assertTrue(scheduler.shouldDraw(Long.MIN_VALUE))
+        assertEquals(false, scheduler.shouldDraw(Long.MIN_VALUE))
+        assertTrue(scheduler.shouldDraw(Long.MIN_VALUE + 17_000_000L))
+    }
+
+    @Test
+    fun `超高刷面板提前容差触发后不误判时间倒退`() {
+        listOf(240.0, 480.0).forEach { hz ->
+            val fps60 = averageFps(hz, DanmakuFrameRateCap.FPS_60)
+            assertTrue(kotlin.math.abs(fps60 - 60.0) <= 1.0, "${hz}Hz 上 60fps 档偏离目标: $fps60")
+        }
+    }
 }

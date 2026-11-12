@@ -3,22 +3,26 @@ package dev.nihildigit.danmaku
 import androidx.compose.foundation.Canvas
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.FrameRateCategory
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalGraphicsContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.preferredFrameRate
 import androidx.compose.ui.text.rememberTextMeasurer
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.time.Duration.Companion.microseconds
+import kotlin.time.TimeSource
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -58,6 +62,18 @@ interface DanmakuClock {
      * 读数用 [SmoothedDanmakuClock] 包一层。外推只在时钟这一层做,host 不做。
      */
     fun positionAtFrame(frameTimeNanos: Long): Long = positionMillis
+
+    /**
+     * 这一帧该画的亚毫秒连续播放位置估计(毫秒,含小数)。
+     *
+     * 默认退回 [positionAtFrame] 的整数值。120/144/165Hz 高刷屏或慢倍速下,整毫秒截断会让相邻两帧
+     * 的时间步长在 `6ms`/`7ms` 之间交替跳变,乘上弹幕速度后变成肉眼可见的微抖;[SmoothedDanmakuClock]
+     * 通过这个方法直接交出滤波器的浮点估计,把量化误差消在源头。
+     */
+    fun precisePositionAtFrame(frameTimeNanos: Long): Double = positionAtFrame(frameTimeNanos).toDouble()
+
+    /** 暂停恢复或显式时间跳变时通知时钟丢弃历史平滑状态,下一帧直接对齐新读数。默认无状态。 */
+    fun onDiscontinuity() {}
 }
 
 /**
@@ -92,24 +108,47 @@ enum class DanmakuFrameRateCap(val targetFps: Int) {
  */
 internal class FrameDeadlineScheduler(private val intervalNanos: Long) {
 
-    private var nextDeadlineNanos = Long.MIN_VALUE
+    private var initialized = false
+    private var nextDeadlineNanos = 0L
+    private var lastFrameNanos = 0L
 
     /** 帧循环挂起过(暂停、屏上没有弹幕)之后调用:时间轴上出现了长空档,不该补画。 */
     fun reset() {
-        nextDeadlineNanos = Long.MIN_VALUE
+        initialized = false
     }
 
     fun shouldDraw(frameNanos: Long): Boolean {
         if (intervalNanos <= 0L) return true
-        if (nextDeadlineNanos == Long.MIN_VALUE || frameNanos - nextDeadlineNanos > intervalNanos) {
-            // 首帧,或者落后了不止一个周期(挂起归来、掉帧)。补画追不回已经过去的时间,
-            // 只会一连出好几帧,所以直接把相位对齐到当前帧重新起算。
+        val toleranceNanos = intervalNanos / TOLERANCE_DIVISOR
+        val lateResyncNanos = intervalNanos / LATE_RESYNC_DIVISOR
+        if (
+            !initialized ||
+            frameNanos - lastFrameNanos < 0L ||
+            frameNanos - nextDeadlineNanos > lateResyncNanos
+        ) {
+            // 首帧、时间源倒退,或者落后超过半个周期(挂起归来、掉帧):直接从当前帧重起一个完整周期,
+            // 避免迟到帧(如 30ms 处)仅隔几毫秒又撞上下一个旧刻度而连续补帧。
+            initialized = true
+            lastFrameNanos = frameNanos
             nextDeadlineNanos = frameNanos + intervalNanos
             return true
         }
-        if (frameNanos < nextDeadlineNanos) return false
+        lastFrameNanos = frameNanos
+        if (nextDeadlineNanos - frameNanos > toleranceNanos) return false
         nextDeadlineNanos += intervalNanos
         return true
+    }
+
+    private companion object {
+        /**
+         * 允许帧时刻比刻度早到 1/4 周期(60fps 档约 4.17ms)。桌面端(Skiko/AWT)帧回调时间采自
+         * 主线程唤醒时刻而非硬件 vsync:若首帧恰落在正抖动(+1.6~2ms)而下一帧落在负抖动(-1.6~2ms),
+         * 相邻峰峰值可达 ~4ms;固定步长推进下常量提前窗只平移初始相位,不改变 90/144/165Hz 的长期均值。
+         */
+        const val TOLERANCE_DIVISOR = 4L
+
+        /** 迟到超过半个目标周期(60fps 档约 8.33ms,大于 60~480Hz 正常取整滞后)视为掉帧并重锚相位。 */
+        const val LATE_RESYNC_DIVISOR = 2L
     }
 }
 
@@ -157,8 +196,17 @@ class DanmakuHostState(
         timeline.visibleAt(positionMillis, visitor)
     }
 
-    /** 通知帧循环重新评估当前状态。见类注释:哪些事件需要调用这个。 */
+    /** 通知帧循环重新评估当前状态(如池更新、倍速切换)。见类注释:哪些事件需要调用这个。 */
     fun notifyChanged() {
+        wake.trySend(Unit)
+    }
+
+    /**
+     * 通知时间轴发生了不连续事件(暂停/恢复、seek、重播):在唤醒帧循环之前先重置平滑时钟状态,
+     * 避免短暂停间隔被外推或小幅正向 seek 被当作连续残差滤波。
+     */
+    fun notifyDiscontinuity() {
+        clock.onDiscontinuity()
         wake.trySend(Unit)
     }
 
@@ -168,28 +216,37 @@ class DanmakuHostState(
      * 列表每次调用前都会被清空重填,不在调用之间保留身份 —— 需要跨帧持有就自己拷贝。
      */
     suspend fun run(onFrame: (visible: List<DanmakuFlightPlan>, positionMillis: Long) -> Unit) {
+        runPrecise { visible, positionMillis ->
+            onFrame(visible, positionMillis.toLong())
+        }
+    }
+
+    internal suspend fun runPrecise(onFrame: (visible: List<DanmakuFlightPlan>, positionMillis: Double) -> Unit) {
         val buffer = mutableListOf<DanmakuFlightPlan>()
         val frameScheduler = FrameDeadlineScheduler(frameRateCap.frameIntervalNanos)
-        // 直接读 clock.positionMillis,不在这一层再插值。历史上这里有一个按锚点 + 经过时间 ×
+        // 直接读 clock,不在这一层再插值。历史上这里有一个按锚点 + 经过时间 ×
         // 倍速做外推的 PositionInterpolator,理由是"positionMillis 通常是粗粒度轮询来源"——
         // 那个前提对 Media3 不成立:`clock` 通常包的是同进程 ExoPlayer 或 MediaController,
         // 两者的 `getCurrentPosition()` 本身就是每次调用现算,内部同样按"锚点位置 + 经过时间 ×
         // 倍速"做外推,也就是说这里再插值一层等于叠了第二个各推各的估计器——两层锚点在权威
         // 更新落地的时刻不同步,倍速刚变化那一小段会互相打架,表现为"抖一下"。既然下层已经
         // 连续,上层插值不会让位置更平滑,只会多引入一处分歧,删掉即可。
-        var coarsePosition = clock.positionMillis
+        var precisePosition = clock.positionMillis.toDouble()
 
         while (true) {
+            val queryPosition = precisePosition.toLong()
             buffer.clear()
-            timeline.visibleAt(coarsePosition) { buffer.add(it) }
+            timeline.visibleAt(queryPosition) { buffer.add(it) }
 
             // 两个挂起条件是"或":没什么可画,或者画了也不会变(暂停)。两者独立判断,
             // 不要合并成互斥分支 —— "暂停且有可见弹幕"这个组合本身就要求先 onFrame 一次
             // 把冻结的画面交出去,再挂起,和"没有可见弹幕"那条走的是同一段收尾代码。
             if (buffer.isEmpty() || !clock.isPlaying) {
-                onFrame(buffer, coarsePosition)
-                awaitNextWakeUp(coarsePosition)
-                coarsePosition = clock.positionMillis
+                if (!clock.isPlaying) clock.onDiscontinuity()
+                onFrame(buffer, precisePosition)
+                awaitNextWakeUp(queryPosition)
+                if (!clock.isPlaying) clock.onDiscontinuity()
+                precisePosition = clock.positionMillis.toDouble()
                 // 挂起期间时间轴上出现了一大段空档,相位要重新对齐,不能拿旧 deadline 补画。
                 frameScheduler.reset()
                 continue
@@ -199,10 +256,10 @@ class DanmakuHostState(
                 // 跳帧判断整个都在回调内部:不出帧就只更新 deadline,不重新采样、不回调。
                 if (!frameScheduler.shouldDraw(frameNanos)) return@withFrameNanos
 
-                coarsePosition = clock.positionAtFrame(frameNanos)
+                precisePosition = clock.precisePositionAtFrame(frameNanos)
                 buffer.clear()
-                timeline.visibleAt(coarsePosition) { buffer.add(it) }
-                onFrame(buffer, coarsePosition)
+                timeline.visibleAt(precisePosition.toLong()) { buffer.add(it) }
+                onFrame(buffer, precisePosition)
             }
         }
     }
@@ -216,12 +273,14 @@ class DanmakuHostState(
     private suspend fun awaitNextWakeUp(position: Long) {
         val next = timeline.nextEntryAfter(position)
         val scheduledDelay = if (next != null && clock.isPlaying) {
-            ((next.emitTimeMillis - position) / clock.playbackSpeed.coerceAtLeast(MIN_PLAYBACK_SPEED)).toLong()
+            ceil((next.emitTimeMillis - position) / clock.playbackSpeed.coerceAtLeast(MIN_PLAYBACK_SPEED)).toLong()
         } else {
             null
         }
         val timeoutMillis = (scheduledDelay ?: IDLE_POLL_FALLBACK_MILLIS)
-            .coerceIn(0L, IDLE_POLL_FALLBACK_MILLIS)
+            // 向上取整并以 1ms 兜底:向零截断会在倍速 > 1 时提前 1ms 醒来,再把不足 1ms 的余量截成 0;
+            // 而 withTimeoutOrNull(0) 直接同步返回 null,既不挂起让出主线程,也不消费 wake。
+            .coerceIn(1L, IDLE_POLL_FALLBACK_MILLIS)
         withTimeoutOrNull(timeoutMillis) { wake.receive() }
     }
 
@@ -271,6 +330,7 @@ fun DanmakuHost(
     // 这个 measurer 只在准备阶段用,每条文本最多进来一次,自带的 LRU 已经不是热路径 ——
     // 真正的排版缓存是 DanmakuRenderCache 里那张按 (文本, 解析后 TextStyle) 建的表。
     val measurer = rememberTextMeasurer()
+    val graphicsContext = LocalGraphicsContext.current
     val density = LocalDensity.current
     val layoutDirection = LocalLayoutDirection.current
     // remember 无条件调用再取,不写成 `renderStats ?: remember { ... }` —— 那样 remember 会被
@@ -278,9 +338,9 @@ fun DanmakuHost(
     val fallbackStats = remember { DanmakuRenderStats() }
     val stats = renderStats ?: fallbackStats
 
-    // 缓存挂在样式和 density 上:字号、字体、颜色兜底、描边、不透明度任一变化,已画的位图全部作废。
-    val cache = remember(measurer, density, layoutDirection, style, stats, imageSource) {
-        DanmakuRenderCache(measurer, density, layoutDirection, style, stats, imageSource)
+    // 缓存挂在样式、图形上下文和 density 上:任一变化,已画的位图与页图层全部作废并释放。
+    val cache = remember(measurer, graphicsContext, density, layoutDirection, style, stats, imageSource) {
+        DanmakuRenderCache(measurer, graphicsContext, density, layoutDirection, style, stats, imageSource)
     }
     // 图集的页要及时放掉。remember 换实例和离开组合两条路都要走到 release,
     // DisposableEffect(cache) 两者都覆盖:key 变化时先 onDispose 旧的。
@@ -293,18 +353,29 @@ fun DanmakuHost(
     // frame 是复用的普通 list,不是 SnapshotStateList——内容变化本身不会触发重组,
     // frameVersion 才是 Canvas 订阅的信号源,列表只是它背后的数据。
     val frame = remember { mutableListOf<DanmakuFlightPlan>() }
-    var framePositionMillis by remember { mutableLongStateOf(0L) }
+    var framePositionMillis by remember { mutableDoubleStateOf(0.0) }
     var frameVersion by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(state, prewarmer) {
-        state.run { visible, positionMillis ->
-            frame.clear()
-            frame.addAll(visible)
-            framePositionMillis = positionMillis
-            frameVersion++
+    LaunchedEffect(state, cache, prewarmer) {
+        var initialized = false
+        state.runPrecise { visible, positionMillis ->
+            val changed = !initialized ||
+                (visible.isEmpty() && frame.isNotEmpty()) ||
+                (visible.isNotEmpty() && (
+                    positionMillis != framePositionMillis ||
+                        visible != frame ||
+                        cache.hasReadyPendingImages(visible)
+                    ))
+            if (changed) {
+                initialized = true
+                frame.clear()
+                frame.addAll(visible)
+                framePositionMillis = positionMillis
+                frameVersion++
+            }
             // 预热放在帧回调而不是绘制块里:绘制块要保持"零测量",而这里已经在主线程的帧
             // 边界上,花掉的是本帧剩余预算,不是下一帧的。
-            prewarmer.onFrame(state, positionMillis)
+            prewarmer.onFrame(state, visible, positionMillis.toLong())
         }
     }
 
@@ -339,7 +410,7 @@ fun DanmakuHost(
         frameVersion
 
         val viewport = layout.viewportPx
-        cache.beginFrame()
+        cache.beginFrame(frame)
 
         // 分两趟画,因为两趟的裁剪区不同。列表通常只有几十条,多扫一遍比先分组便宜,也不用
         // 为分组分配两个列表。
@@ -347,25 +418,27 @@ fun DanmakuHost(
         // 第一趟:滚动 + 顶部,裁到视口。没有这次裁剪,显示区域就退化成"轨道数少了几条",
         // 弹幕照样画到区域外面去。
         clipRect(left = viewport.left, top = viewport.top, right = viewport.right, bottom = viewport.bottom) {
-            for (plan in frame) {
+            for (i in 0 until frame.size) {
+                val plan = frame[i]
                 if (plan.mode == DanmakuMode.BOTTOM) continue
                 val y = viewport.top + plan.track * layout.trackHeightPx
                 val x = if (plan.mode == DanmakuMode.SCROLL) {
-                    viewport.right - (framePositionMillis - plan.emitTimeMillis) * plan.speedPxPerMillis
+                    (viewport.right - (framePositionMillis - plan.emitTimeMillis) * plan.speedPxPerMillis).toFloat()
                 } else {
                     centeredX(viewport.left, viewport.width, plan.widthPx)
                 }
-                cache.draw(this, plan.danmaku, x, y)
+                cache.drawPrepared(this, i, x, y)
             }
         }
 
         // 第二趟:底部弹幕锚**画布**底边往上堆,不进视口的裁剪区——收进视口它就成了"画面
         // 四分之三处的弹幕",不再是底部弹幕(理由见 DanmakuViewport)。它因此会和字幕、
         // 播放控件抢画面底部那条带,这是底部弹幕固有的,将来靠避让区解决。
-        for (plan in frame) {
+        for (i in 0 until frame.size) {
+            val plan = frame[i]
             if (plan.mode != DanmakuMode.BOTTOM) continue
             val y = size.height - (plan.track + 1) * layout.trackHeightPx
-            cache.draw(this, plan.danmaku, centeredX(0f, size.width, plan.widthPx), y)
+            cache.drawPrepared(this, i, centeredX(0f, size.width, plan.widthPx), y)
         }
 
         cache.endFrame()
@@ -376,27 +449,44 @@ fun DanmakuHost(
  * 预热驱动。每隔 [PREWARM_INTERVAL_MILLIS] 播放时间往前看 [PREWARM_LOOKAHEAD_MILLIS],把那时会
  * 在屏的弹幕提前准备好。
  *
- * 有预算上限是因为准备工作(排版 + 栅格化进图集)是主线程活儿:一次把上百条全准备了,
- * 省下的每帧成本会以一个几十毫秒的尖峰还回去,直方图上就是一个新的丢帧。分摊到多帧做,窗口
- * 有一两秒的余量,来得及。
- *
- * 按间隔成批做而不是每帧做一点,还因为图集的页每改一次平台就整页重传一次:同一批写进同一页,
- * 一批只传一次。
+ * 同时受条数与墙钟耗时双重预算约束:桌面端 CJK 描边 + 填充栅格化单条耗时可能比移动端略波动,
+ * 单看条数仍可能在密集进场时吃穿单帧主线程预算。若本轮因任一预算截断而没把窗口内的条目备完,
+ * 不更新节流锚点,下一帧接着把剩余条目分摊做完;一旦整窗备齐,则恢复按 [PREWARM_INTERVAL_MILLIS]
+ * 成批攒写,减少图集脏页重录次数。
  *
  * 用播放时间而不是帧数做节流,是因为倍速播放时"多久之后上屏"跟着倍速走,而帧数不跟。
  */
-private class DanmakuPrewarmer(private val cache: DanmakuRenderCache) {
+internal class DanmakuPrewarmer(private val cache: DanmakuRenderCache) {
 
-    private var lastPositionMillis = Long.MIN_VALUE
+    private var hasCompletedPass = false
+    private var lastCompletedPositionMillis = 0L
 
-    fun onFrame(state: DanmakuHostState, positionMillis: Long) {
-        // abs 而不是差值:seek 往回跳同样要立刻重新预热。
-        if (abs(positionMillis - lastPositionMillis) < PREWARM_INTERVAL_MILLIS) return
-        lastPositionMillis = positionMillis
+    fun onFrame(state: DanmakuHostState, visible: List<DanmakuFlightPlan>, positionMillis: Long) {
+        if (hasCompletedPass) {
+            val delta = positionMillis - lastCompletedPositionMillis
+            if (delta > -PREWARM_INTERVAL_MILLIS && delta < PREWARM_INTERVAL_MILLIS) return
+        }
+        cache.protectVisible(visible)
+        val start = TimeSource.Monotonic.markNow()
         var budget = PREWARM_BUDGET_PER_PASS
+        var scanned = 0
+        var cutShort = false
         state.forEachVisibleAt(positionMillis + PREWARM_LOOKAHEAD_MILLIS) { plan ->
-            // 预算用完不提前退出:visitor 没有中断口子,而扫剩下的部分只是每条一次哈希查询。
-            if (budget > 0 && cache.prepare(plan.danmaku)) budget--
+            if (cutShort) return@forEachVisibleAt
+            if ((++scanned and SCAN_TIME_CHECK_MASK) == 0 && start.elapsedNow() >= PREWARM_TIME_BUDGET) {
+                cutShort = true
+                return@forEachVisibleAt
+            }
+            if (cache.prepare(plan.danmaku)) {
+                budget--
+                if (budget <= 0 || start.elapsedNow() >= PREWARM_TIME_BUDGET) {
+                    cutShort = true
+                }
+            }
+        }
+        if (!cutShort) {
+            hasCompletedPass = true
+            lastCompletedPositionMillis = positionMillis
         }
     }
 
@@ -404,6 +494,8 @@ private class DanmakuPrewarmer(private val cache: DanmakuRenderCache) {
         const val PREWARM_LOOKAHEAD_MILLIS = 1_500L
         const val PREWARM_INTERVAL_MILLIS = 100L
         const val PREWARM_BUDGET_PER_PASS = 24
+        const val SCAN_TIME_CHECK_MASK = 31
+        val PREWARM_TIME_BUDGET = 2_500.microseconds
     }
 }
 
